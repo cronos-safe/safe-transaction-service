@@ -54,6 +54,7 @@ from .services import (
     TransactionServiceProvider,
 )
 from .services.collectibles_service import CollectiblesServiceProvider
+from .services.safe_service import CannotGetSafeInfoFromBlockchain
 
 logger = logging.getLogger(__name__)
 
@@ -988,15 +989,16 @@ class SafeInfoView(GenericAPIView):
             return Response(status=status.HTTP_404_NOT_FOUND)
 
         try:
-            safe_info = SafeLastStatus.objects.get(address=address).get_safe_info()
+            # safe_info = SafeServiceProvider().get_safe_info(address)
+            safe_info = SafeServiceProvider().get_safe_info_from_blockchain(address)
             serializer = self.get_serializer(safe_info)
             return Response(status=status.HTTP_200_OK, data=serializer.data)
-        except SafeLastStatus.DoesNotExist:
+        except CannotGetSafeInfoFromBlockchain:
             return Response(
                 status=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 data={
                     "code": 50,
-                    "message": "Service is still indexing",
+                    "message": "Cannot get Safe info from blockchain",
                     "arguments": [address],
                 },
             )
@@ -1004,8 +1006,10 @@ class SafeInfoView(GenericAPIView):
 
 class MasterCopiesView(ListAPIView):
     serializer_class = serializers.MasterCopyResponseSerializer
-    queryset = SafeMasterCopy.objects.all()
     pagination_class = None
+
+    def get_queryset(self):
+        return SafeMasterCopy.objects.relevant()
 
 
 class OwnersView(GenericAPIView):
