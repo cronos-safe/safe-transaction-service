@@ -143,4 +143,4 @@ class CoingeckoClient:
         return self.get_price("gather")
 
     def get_cronos_usd_price(self) -> float:
-        return self.get_price("cronos")
+        return self.get_price("crypto-com-chain")
