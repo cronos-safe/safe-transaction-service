@@ -205,6 +205,11 @@ class PriceService:
             except CannotGetPrice:
                 return 1  # DAI/USD should be close to 1
         elif self.ethereum_network in (
+            EthereumNetwork.CRONOS_MAINNET,
+            EthereumNetwork.CRONOS_TESTNET,
+        ):
+            return self.get_cronos_usd_price()
+        elif self.ethereum_network in (
             EthereumNetwork.ENERGY_WEB_CHAIN,
             EthereumNetwork.VOLTA,
         ):
