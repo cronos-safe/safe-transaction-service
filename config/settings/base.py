@@ -199,7 +199,7 @@ EMAIL_BACKEND = env(
 ADMIN_URL = "admin/"
 # https://docs.djangoproject.com/en/dev/ref/settings/#admins
 ADMINS = [
-    ("Gnosis Safe team", "safe@gnosis.io"),
+    ("Cronos Safe team", "safe@gnosis.io"),
 ]
 # https://docs.djangoproject.com/en/dev/ref/settings/#managers
 MANAGERS = ADMINS
@@ -215,7 +215,7 @@ CELERY_BROKER_URL = env("CELERY_BROKER_URL", default="django://")
 # https://docs.celeryproject.org/en/stable/userguide/optimizing.html#broker-connection-pools
 # https://docs.celeryq.dev/en/latest/userguide/optimizing.html#broker-connection-pools
 CELERY_BROKER_POOL_LIMIT = env(
-    "CELERY_BROKER_POOL_LIMIT", default=env("CELERYD_CONCURRENCY", default=500)
+    "CELERY_BROKER_POOL_LIMIT", default=env("CELERYD_CONCURRENCY", default=1000)
 )
 # http://docs.celeryproject.org/en/latest/userguide/configuration.html#std:setting-result_backend
 CELERY_RESULT_BACKEND = env("CELERY_RESULT_BACKEND", default="redis://")
@@ -231,13 +231,24 @@ CELERY_IGNORE_RESULT = True
 CELERY_ALWAYS_EAGER = False
 # https://docs.celeryproject.org/en/latest/userguide/configuration.html#task-default-priority
 # Higher = more priority on RabbitMQ, opposite on Redis ¯\_(ツ)_/¯
-CELERY_TASK_DEFAULT_PRIORITY = 3
+CELERY_TASK_DEFAULT_PRIORITY = 5
 # https://docs.celeryproject.org/en/stable/userguide/configuration.html#task-queue-max-priority
 CELERY_TASK_QUEUE_MAX_PRIORITY = 10
 # https://docs.celeryproject.org/en/latest/userguide/configuration.html#broker-transport-options
-CELERY_BROKER_TRANSPORT_OPTIONS = {
-    "queue_order_strategy": "priority",
-}
+CELERY_BROKER_TRANSPORT_OPTIONS = {}
+# https://docs.celeryq.dev/en/stable/userguide/configuration.html#std-setting-task_routes
+CELERY_ROUTES = (
+    [
+        (
+            "safe_transaction_service.history.tasks.send_webhook_task",
+            {"queue": "webhooks"},
+        ),
+        ("safe_transaction_service.history.tasks.*", {"queue": "indexing"}),
+        ("safe_transaction_service.contracts.tasks.*", {"queue": "contracts"}),
+        ("safe_transaction_service.notifications.tasks.*", {"queue": "notifications"}),
+        ("safe_transaction_service.tokens.tasks.*", {"queue": "tokens"}),
+    ],
+)
 
 
 # Django REST Framework

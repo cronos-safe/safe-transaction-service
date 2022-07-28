@@ -1,3 +1,5 @@
+import itertools
+from collections import OrderedDict
 from unittest import mock
 from unittest.mock import MagicMock, PropertyMock
 
@@ -17,12 +19,14 @@ from ..models import (
     InternalTx,
     InternalTxDecoded,
     SafeContract,
+    SafeLastStatus,
     SafeMasterCopy,
     SafeStatus,
 )
 from .factories import SafeMasterCopyFactory
 from .mocks.mocks_internal_tx_indexer import (
     block_result,
+    trace_blocks_filtered_0x5aC2_result,
     trace_blocks_result,
     trace_filter_result,
     trace_transactions_result,
@@ -151,11 +155,11 @@ class TestInternalTxIndexer(TestCase):
         )
         self.assertEqual(ethereum_tx.logs, [])
 
-        trace_filter_mock.assert_called_with(
+        trace_filter_mock.assert_called_once_with(
             internal_tx_indexer.ethereum_client.parity,
             from_block=1,
             to_block=current_block_number - internal_tx_indexer.number_trace_blocks,
-            from_address=[safe_master_copy.address],
+            to_address=[safe_master_copy.address],
         )
         trace_block_mock.assert_called_with(
             internal_tx_indexer.ethereum_client.parity,
@@ -171,7 +175,10 @@ class TestInternalTxIndexer(TestCase):
         self._test_internal_tx_indexer()
 
     @mock.patch.object(
-        ParityManager, "trace_blocks", autospec=True, return_value=trace_blocks_result
+        ParityManager,
+        "trace_blocks",
+        autospec=True,
+        return_value=trace_blocks_filtered_0x5aC2_result,
     )
     @mock.patch.object(
         ParityManager, "trace_filter", autospec=True, return_value=trace_filter_result
@@ -188,31 +195,28 @@ class TestInternalTxIndexer(TestCase):
         trace_filter_mock: MagicMock,
         trace_block_mock: MagicMock,
     ):
-
         current_block_number = current_block_number_mock.return_value
         internal_tx_indexer = self.internal_tx_indexer
         addresses = ["0x5aC255889882aCd3da2aA939679E3f3d4cea221e"]
-        trace_filter_transactions = [
-            trace["transactionHash"] for trace in trace_filter_mock.return_value
-        ]
-        trace_block_transactions = [
-            trace["transactionHash"]
-            for sublist in trace_block_mock.return_value
-            for trace in sublist
-        ]
+        trace_filter_transactions = OrderedDict(
+            (trace["transactionHash"], []) for trace in trace_filter_mock.return_value
+        )
+        trace_block_transactions = OrderedDict(
+            (
+                (k, list(v))
+                for k, v in itertools.groupby(
+                    itertools.chain(*trace_block_mock.return_value),
+                    lambda x: x["transactionHash"],
+                )
+            )
+        )
 
         # Just trace filter
         elements = internal_tx_indexer.find_relevant_elements(
             addresses, 1, current_block_number - 50
         )
-        self.assertCountEqual(set(trace_filter_transactions), elements)
-        trace_filter_mock.assert_any_call(
-            internal_tx_indexer.ethereum_client.parity,
-            from_block=1,
-            to_block=current_block_number - 50,
-            from_address=addresses,
-        )
-        trace_filter_mock.assert_any_call(
+        self.assertEqual(trace_filter_transactions, elements)
+        trace_filter_mock.assert_called_once_with(
             internal_tx_indexer.ethereum_client.parity,
             from_block=1,
             to_block=current_block_number - 50,
@@ -225,14 +229,15 @@ class TestInternalTxIndexer(TestCase):
         elements = internal_tx_indexer.find_relevant_elements(
             addresses, current_block_number - 50, current_block_number
         )
-        self.assertCountEqual(
-            set(trace_filter_transactions).union(trace_block_transactions), elements
-        )
-        trace_filter_mock.assert_any_call(
+        print(trace_filter_transactions | trace_block_transactions)
+        print()
+        print(elements)
+        self.assertEqual(trace_filter_transactions | trace_block_transactions, elements)
+        trace_filter_mock.assert_called_once_with(
             internal_tx_indexer.ethereum_client.parity,
             from_block=current_block_number - 50,
             to_block=current_block_number - internal_tx_indexer.number_trace_blocks,
-            from_address=addresses,
+            to_address=addresses,
         )
 
         trace_block_mock.assert_called_with(
@@ -252,7 +257,7 @@ class TestInternalTxIndexer(TestCase):
         elements = internal_tx_indexer.find_relevant_elements(
             addresses, current_block_number - 3, current_block_number
         )
-        self.assertCountEqual(set(trace_block_transactions), elements)
+        self.assertEqual(trace_block_transactions, elements)
         trace_filter_mock.assert_not_called()
 
         trace_block_mock.assert_called_with(
@@ -265,30 +270,36 @@ class TestInternalTxIndexer(TestCase):
         tx_processor = SafeTxProcessorProvider()
         self.assertEqual(InternalTxDecoded.objects.count(), 2)  # Setup and execute tx
         internal_txs_decoded = InternalTxDecoded.objects.pending_for_safes()
-        self.assertEqual(len(internal_txs_decoded), 1)  # Safe not indexed yet
+        self.assertEqual(len(internal_txs_decoded), 2)
         number_processed = tx_processor.process_decoded_transactions(
             internal_txs_decoded
         )  # Index using `setup` trace
-        self.assertEqual(len(number_processed), 1)  # Setup trace
+        self.assertEqual(len(number_processed), 2)  # Setup and execute trace
         self.assertEqual(SafeContract.objects.count(), 1)
+        self.assertEqual(SafeStatus.objects.count(), 2)
 
         safe_status = SafeStatus.objects.first()
         self.assertEqual(len(safe_status.owners), 1)
         self.assertEqual(safe_status.nonce, 0)
         self.assertEqual(safe_status.threshold, 1)
 
-        # Decode again now that Safe is indexed (with `setup` call)
+        # Try to decode again without new traces, nothing should be decoded
         internal_txs_decoded = InternalTxDecoded.objects.pending_for_safes()
         self.assertEqual(
-            len(internal_txs_decoded), 1
+            len(internal_txs_decoded), 0
         )  # Safe indexed, execute tx can be decoded now
         number_processed = tx_processor.process_decoded_transactions(
             internal_txs_decoded
         )
-        self.assertEqual(len(number_processed), 1)  # Setup trace
+        self.assertEqual(len(number_processed), 0)  # Setup trace
         safe_status = SafeStatus.objects.get(nonce=1)
         self.assertEqual(len(safe_status.owners), 1)
         self.assertEqual(safe_status.threshold, 1)
+
+        safe_last_status = SafeLastStatus.objects.get()
+        self.assertEqual(
+            safe_last_status, SafeLastStatus.from_status_instance(safe_status)
+        )
 
     def test_tx_processor_using_internal_tx_indexer_with_existing_safe(self):
         self._test_internal_tx_indexer()

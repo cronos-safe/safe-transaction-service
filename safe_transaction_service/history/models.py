@@ -1,7 +1,7 @@
 import datetime
 from decimal import Decimal
 from enum import Enum
-from functools import lru_cache
+from functools import cache, lru_cache
 from itertools import islice
 from logging import getLogger
 from typing import (
@@ -23,7 +23,7 @@ from django.conf import settings
 from django.contrib.postgres.fields import ArrayField
 from django.contrib.postgres.indexes import GinIndex
 from django.core.exceptions import ValidationError
-from django.db import IntegrityError, models, transaction
+from django.db import IntegrityError, connection, models, transaction
 from django.db.models import Case, Count, Index, JSONField, Max, Q, QuerySet
 from django.db.models.expressions import F, OuterRef, RawSQL, Subquery, Value, When
 from django.db.models.functions import Coalesce
@@ -44,6 +44,7 @@ from gnosis.eth.django.models import (
     Keccak256Field,
     Uint256Field,
 )
+from gnosis.eth.utils import fast_to_checksum_address
 from gnosis.safe import SafeOperation
 from gnosis.safe.safe import SafeInfo
 from gnosis.safe.safe_signature import SafeSignature, SafeSignatureType
@@ -121,7 +122,7 @@ class BulkCreateSignalMixin:
     def bulk_create(
         self, objs, batch_size: Optional[int] = None, ignore_conflicts: bool = False
     ):
-        objs = list(objs)  # If not it won't be iterate later
+        objs = list(objs)  # If not it won't be iterated later
         result = super().bulk_create(
             objs, batch_size=batch_size, ignore_conflicts=ignore_conflicts
         )
@@ -228,8 +229,8 @@ class EthereumBlockQuerySet(models.QuerySet):
 class EthereumBlock(models.Model):
     objects = EthereumBlockManager.from_queryset(EthereumBlockQuerySet)()
     number = models.PositiveIntegerField(primary_key=True)
-    gas_limit = models.PositiveIntegerField()
-    gas_used = models.PositiveIntegerField()
+    gas_limit = Uint256Field()
+    gas_used = Uint256Field()
     timestamp = models.DateTimeField()
     block_hash = Keccak256Field(unique=True)
     parent_hash = Keccak256Field(unique=True)
@@ -499,41 +500,55 @@ class ERC20Transfer(TokenTransfer):
 
 
 class ERC721TransferManager(TokenTransferManager):
-    # TODO Optimize this
-    def erc721_owned_by(self, address: str) -> List[Tuple[str, int]]:
+    def erc721_owned_by(
+        self,
+        address: ChecksumAddress,
+        only_trusted: Optional[bool] = None,
+        exclude_spam: Optional[bool] = None,
+    ) -> List[Tuple[ChecksumAddress, int]]:
         """
         Returns erc721 owned by address, removing the ones sent
 
         :return: List of tuples(token_address: str, token_id: int)
         """
-        # Get all the token history
-        erc721_events = self.to_or_from(address)
-        # Get tokens received and remove tokens transferred
-        tokens_in: Tuple[str, int] = []
-        tokens_out: Tuple[str, int] = []
-        for erc721_event in erc721_events:
-            token_address = erc721_event.address
-            token_id = erc721_event.token_id
-            if token_id is None:
-                logger.error(
-                    "TokenId for ERC721 info token=%s with owner=%s can never be None",
-                    token_address,
-                    address,
-                )
-                continue
-            if erc721_event.to == erc721_event._from:
-                continue  # Nice try ¯\_(ツ)_/¯
 
-            if erc721_event.to == address:
-                list_to_append = tokens_in
-            else:
-                list_to_append = tokens_out
-            list_to_append.append((token_address, token_id))
+        owned_by_query = """
+        SELECT Q1.address, Q1.token_id
+        FROM (SELECT address,
+                     token_id,
+                     Count(*) AS count
+              FROM   history_erc721transfer
+              WHERE  "to" = %s AND "to" != "_from"
+              GROUP  BY address,
+                        token_id) Q1
+             LEFT JOIN (SELECT address,
+                               token_id,
+                               Count(*) AS count
+                        FROM   history_erc721transfer
+                        WHERE  "_from" = %s AND "to" != "_from"
+                        GROUP  BY address,
+                                  token_id) Q2
+                    ON Q1.address = Q2.address
+                       AND Q1.token_id = Q2.token_id
+        WHERE Q1.count > COALESCE(Q2.count, 0)
+        """
 
-        for token_out in tokens_out:  # Remove tokens sent from list
-            if token_out in tokens_in:
-                tokens_in.remove(token_out)
-        return tokens_in
+        if only_trusted:
+            owned_by_query += " AND Q1.address IN (SELECT address FROM tokens_token WHERE trusted = TRUE)"
+        elif exclude_spam:
+            owned_by_query += " AND Q1.address NOT IN (SELECT address FROM tokens_token WHERE spam = TRUE)"
+
+        # Sort by token `address`, then by `token_id` to be stable
+        owned_by_query += " ORDER BY Q1.address, Q2.token_id"
+
+        with connection.cursor() as cursor:
+            hex_address = HexBytes(address)
+            # Queries all the ERC721 IN and all OUT and only returns the ones currently owned
+            cursor.execute(owned_by_query, [hex_address, hex_address])
+            return [
+                (fast_to_checksum_address(bytes(address)), int(token_id))
+                for address, token_id in cursor.fetchall()
+            ]
 
 
 class ERC721TransferQuerySet(TokenTransferQuerySet):
@@ -791,7 +806,9 @@ class InternalTx(models.Model):
     )
     timestamp = models.DateTimeField(db_index=True)
     block_number = models.PositiveIntegerField(db_index=True)
-    _from = EthereumAddressV2Field(null=True)  # For SELF-DESTRUCT it can be null
+    _from = EthereumAddressV2Field(
+        null=True, db_index=True
+    )  # For SELF-DESTRUCT it can be null
     gas = Uint256Field()
     data = models.BinaryField(null=True)  # `input` for Call, `init` for Create
     to = EthereumAddressV2Field(null=True)
@@ -923,18 +940,6 @@ class InternalTxDecodedQuerySet(models.QuerySet):
         """
         return self.filter(internal_tx___from=safe_address)
 
-    def for_indexed_safes(self):
-        """
-        :return: Queryset of InternalTxDecoded for Safes already indexed or calling `setup`. Use this to index Safes
-        for the first time
-        """
-        return self.filter(
-            Q(
-                internal_tx___from__in=SafeContract.objects.values("address")
-            )  # Just Safes indexed
-            | Q(function_name="setup")  # This way we can index new Safes without events
-        )
-
     def not_processed(self):
         return self.filter(processed=False)
 
@@ -951,35 +956,31 @@ class InternalTxDecodedQuerySet(models.QuerySet):
             "is_setup",
             "internal_tx__block_number",
             "internal_tx__ethereum_tx__transaction_index",
-            "internal_tx__trace_address",
+            "internal_tx_id",
         )
 
     def pending_for_safes(self):
         """
         :return: Pending `InternalTxDecoded` sorted by block number and then transaction index inside the block
         """
-        return (
-            self.not_processed()
-            .for_indexed_safes()
-            .select_related(
-                "internal_tx__ethereum_tx__block",
-            )
-            .order_by_processing_queue()
-        )
+        return self.not_processed().order_by_processing_queue()
 
     def pending_for_safe(self, safe_address: str):
         """
         :return: Pending `InternalTxDecoded` sorted by block number and then transaction index inside the block
         """
-        return self.pending_for_safes().filter(internal_tx___from=safe_address)
+        return (
+            self.pending_for_safes()
+            .filter(internal_tx___from=safe_address)
+            .select_related("internal_tx")
+        )
 
-    def safes_pending_to_be_processed(self) -> QuerySet:
+    def safes_pending_to_be_processed(self) -> QuerySet[ChecksumAddress]:
         """
         :return: List of Safe addresses that have transactions pending to be processed
         """
         return (
             self.not_processed()
-            .for_indexed_safes()
             .values_list("internal_tx___from", flat=True)
             .distinct("internal_tx___from")
         )
@@ -1019,7 +1020,7 @@ class InternalTxDecoded(models.Model):
 
     @property
     def block_number(self) -> Type[int]:
-        return self.internal_tx.ethereum_tx.block_id
+        return self.internal_tx.block_number
 
     @property
     def tx_hash(self) -> Type[int]:
@@ -1127,6 +1128,12 @@ class MultisigTransactionQuerySet(models.QuerySet):
     def not_executed(self):
         return self.filter(ethereum_tx=None)
 
+    def with_data(self):
+        return self.exclude(data=None)
+
+    def without_data(self):
+        return self.filter(data=None)
+
     def with_confirmations(self):
         return self.exclude(confirmations__isnull=True)
 
@@ -1184,20 +1191,20 @@ class MultisigTransaction(TimeStampedModel):
     )
     to = EthereumAddressV2Field(null=True, db_index=True)
     value = Uint256Field()
-    data = models.BinaryField(null=True)
+    data = models.BinaryField(null=True, blank=True, editable=True)
     operation = models.PositiveSmallIntegerField(
         choices=[(tag.value, tag.name) for tag in SafeOperation]
     )
     safe_tx_gas = Uint256Field()
     base_gas = Uint256Field()
     gas_price = Uint256Field()
-    gas_token = EthereumAddressV2Field(null=True)
-    refund_receiver = EthereumAddressV2Field(null=True)
-    signatures = models.BinaryField(null=True)  # When tx is executed
+    gas_token = EthereumAddressV2Field(null=True, blank=True)
+    refund_receiver = EthereumAddressV2Field(null=True, blank=True)
+    signatures = models.BinaryField(null=True, blank=True)  # When tx is executed
     nonce = Uint256Field(db_index=True)
-    failed = models.BooleanField(null=True, default=None, db_index=True)
+    failed = models.BooleanField(null=True, blank=True, default=None, db_index=True)
     origin = models.CharField(
-        null=True, default=None, max_length=200
+        null=True, blank=True, default=None, max_length=200
     )  # To store arbitrary data on the tx
     trusted = models.BooleanField(
         default=False, db_index=True
@@ -1283,13 +1290,8 @@ class ModuleTransaction(TimeStampedModel):
             return f"{self.safe} - {self.to} - 0x{bytes(self.data).hex()[:6]}"
 
     @property
-    def execution_date(self) -> Optional[datetime.datetime]:
-        if (
-            self.internal_tx.ethereum_tx_id
-            and self.internal_tx.ethereum_tx.block_id is not None
-        ):
-            return self.internal_tx.ethereum_tx.block.timestamp
-        return None
+    def execution_date(self) -> datetime.datetime:
+        return self.internal_tx.timestamp
 
 
 class MultisigConfirmationManager(models.Manager):
@@ -1391,6 +1393,7 @@ def validate_version(value: str):
 
 
 class SafeMasterCopyManager(models.Manager):
+    @cache
     def get_version_for_address(self, address: ChecksumAddress) -> Optional[str]:
         try:
             return self.filter(address=address).only("version").get().version
@@ -1517,7 +1520,7 @@ class SafeStatusBase(models.Model):
     master_copy = EthereumAddressV2Field()
     fallback_handler = EthereumAddressV2Field()
     guard = EthereumAddressV2Field(default=None, null=True)
-    enabled_modules = ArrayField(EthereumAddressV2Field(), default=list)
+    enabled_modules = ArrayField(EthereumAddressV2Field(), default=list, blank=True)
 
     class Meta:
         abstract = True
@@ -1565,6 +1568,21 @@ class SafeStatusBase(models.Model):
 
 
 class SafeLastStatusManager(models.Manager):
+    def get_or_generate(self, address: ChecksumAddress) -> "SafeLastStatus":
+        """
+        :param address:
+        :return: `SafeLastStatus` if it exists. If not, it will try to build it from `SafeStatus` table
+        """
+        try:
+            return SafeLastStatus.objects.get(address=address)
+        except self.model.DoesNotExist:
+            safe_status = SafeStatus.objects.last_for_address(address)
+            if safe_status:
+                return SafeLastStatus.objects.update_or_create_from_safe_status(
+                    safe_status
+                )
+            raise
+
     def update_or_create_from_safe_status(
         self, safe_status: "SafeStatus"
     ) -> "SafeLastStatus":
@@ -1583,10 +1601,20 @@ class SafeLastStatusManager(models.Manager):
         )
         return obj
 
+    def addresses_for_module(self, module_address: str) -> QuerySet[str]:
+        """
+        :param module_address:
+        :return: Safes where the provided `module_address` is enabled
+        """
+
+        return self.filter(enabled_modules__contains=[module_address]).values_list(
+            "address", flat=True
+        )
+
     def addresses_for_owner(self, owner_address: str) -> QuerySet[str]:
         """
         :param owner_address:
-        :return: Safes for an owner
+        :return: Safes where the provided `owner_address` is an owner
         """
 
         return self.filter(owners__contains=[owner_address]).values_list(
@@ -1600,6 +1628,7 @@ class SafeLastStatus(SafeStatusBase):
     class Meta:
         indexes = [
             GinIndex(fields=["owners"]),
+            GinIndex(fields=["enabled_modules"]),
         ]
         verbose_name_plural = "Safe last statuses"
 
@@ -1610,12 +1639,9 @@ class SafeLastStatus(SafeStatusBase):
         """
         :return: SafeInfo built from SafeLastStatus (not requiring connection to Ethereum RPC)
         """
-        try:
-            master_copy_version = SafeMasterCopy.objects.get(
-                address=self.master_copy
-            ).version
-        except SafeMasterCopy.DoesNotExist:
-            master_copy_version = "UNKNOWN"
+        master_copy_version = SafeMasterCopy.objects.get_version_for_address(
+            self.master_copy
+        )
 
         return SafeInfo(
             self.address,
@@ -1648,7 +1674,7 @@ class SafeStatusQuerySet(models.QuerySet):
             "-nonce",
             "-internal_tx__block_number",
             "-internal_tx__ethereum_tx__transaction_index",
-            "-internal_tx__trace_address",
+            "-internal_tx_id",
         )
 
     def sorted_reverse_by_mined(self):
@@ -1657,7 +1683,7 @@ class SafeStatusQuerySet(models.QuerySet):
             "nonce",
             "internal_tx__block_number",
             "internal_tx__ethereum_tx__transaction_index",
-            "internal_tx__trace_address",
+            "internal_tx_id",
         )
 
     def last_for_every_address(self) -> QuerySet:

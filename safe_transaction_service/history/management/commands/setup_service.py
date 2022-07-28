@@ -57,14 +57,14 @@ TASKS = [
     CeleryTaskConfiguration(
         "safe_transaction_service.history.tasks.index_internal_txs_task",
         "Index Internal Txs",
-        13,
+        5,
         IntervalSchedule.SECONDS,
         enabled=not settings.ETH_L2_NETWORK,
     ),
     CeleryTaskConfiguration(
         "safe_transaction_service.history.tasks.index_safe_events_task",
         "Index Safe events (L2)",
-        13,
+        5,
         IntervalSchedule.SECONDS,
         enabled=settings.ETH_L2_NETWORK,
     ),
@@ -264,6 +264,36 @@ MASTER_COPIES: Dict[EthereumNetwork, List[Tuple[str, int, str]]] = {
         ("0x3E5c63644E683549055b9Be8653de26E0B4CD36E", 748810, "1.3.0+L2"),
         ("0xd9Db270c1B5E3Bd161E8c8503c55cEABeE709552", 748815, "1.3.0"),
     ],
+    EthereumNetwork.CRONOS_MAINNET: [
+        ("0xfb1bffC9d739B8D520DaF37dF666da4C687191EA", 3002268, "1.3.0+L2"),
+        ("0x69f4D1788e39c87893C980c06EdF4b7f686e2938", 3002760, "1.3.0"),
+    ],
+    EthereumNetwork.CRONOS_TESTNET: [
+        ("0xfb1bffC9d739B8D520DaF37dF666da4C687191EA", 3290833, "1.3.0+L2"),
+        ("0x69f4D1788e39c87893C980c06EdF4b7f686e2938", 3290835, "1.3.0"),
+    ],
+    EthereumNetwork.METER: [
+        ("0xfb1bffC9d739B8D520DaF37dF666da4C687191EA", 23863901, "1.3.0+L2")  # v1.3.0
+    ],
+    EthereumNetwork.METER_TESTNET: [
+        ("0xfb1bffC9d739B8D520DaF37dF666da4C687191EA", 15035438, "1.3.0+L2")  # v1.3.0
+    ],
+    EthereumNetwork.EURUS_MAINNET: [
+        ("0x3E5c63644E683549055b9Be8653de26E0B4CD36E", 7127163, "1.3.0+L2"),
+        ("0xd9Db270c1B5E3Bd161E8c8503c55cEABeE709552", 7127166, "1.3.0"),
+    ],
+    EthereumNetwork.EURUS_TESTNET: [
+        ("0x3E5c63644E683549055b9Be8653de26E0B4CD36E", 12845441, "1.3.0+L2"),
+        ("0xd9Db270c1B5E3Bd161E8c8503c55cEABeE709552", 12845443, "1.3.0"),
+    ],
+    EthereumNetwork.VENIDIUM_TESTNET: [
+        ("0x3E5c63644E683549055b9Be8653de26E0B4CD36E", 761243, "1.3.0+L2"),
+        ("0xd9Db270c1B5E3Bd161E8c8503c55cEABeE709552", 761244, "1.3.0"),
+    ],
+    EthereumNetwork.GODWOKEN_TESTNET: [
+        ("0xfb1bffC9d739B8D520DaF37dF666da4C687191EA", 93204, "1.3.0+L2"),
+        ("0x69f4D1788e39c87893C980c06EdF4b7f686e2938", 93168, "1.3.0"),
+    ],
 }
 
 PROXY_FACTORIES: Dict[EthereumNetwork, List[Tuple[str, int]]] = {
@@ -368,7 +398,31 @@ PROXY_FACTORIES: Dict[EthereumNetwork, List[Tuple[str, int]]] = {
         ("0xa6B71E26C5e0845f74c812102Ca7114b6a896AB2", 2387999),  # v1.3.0
     ],
     EthereumNetwork.REI_TESTNET: [
-        ("0xa6B71E26C5e0845f74c812102Ca7114b6a896AB2", 748768),  # v1.3.0
+        ("0xC22834581EbC8527d974F8a1c97E1bEA4EF910BC", 748768),  # v1.3.0
+    ],
+    EthereumNetwork.CRONOS_MAINNET: [
+        ("0xC22834581EbC8527d974F8a1c97E1bEA4EF910BC", 2958469),  # v1.3.0
+    ],
+    EthereumNetwork.CRONOS_TESTNET: [
+        ("0xC22834581EbC8527d974F8a1c97E1bEA4EF910BC", 3290819),  # v1.3.0
+    ],
+    EthereumNetwork.METER: [
+        ("0xC22834581EbC8527d974F8a1c97E1bEA4EF910BC", 23863720),  # v1.3.0
+    ],
+    EthereumNetwork.METER_TESTNET: [
+        ("0xC22834581EbC8527d974F8a1c97E1bEA4EF910BC", 15035363),  # v1.3.0
+    ],
+    EthereumNetwork.EURUS_MAINNET: [
+        ("0xa6B71E26C5e0845f74c812102Ca7114b6a896AB2", 7127155),  # v1.3.0
+    ],
+    EthereumNetwork.EURUS_TESTNET: [
+        ("0xa6B71E26C5e0845f74c812102Ca7114b6a896AB2", 12845425),  # v1.3.0
+    ],
+    EthereumNetwork.VENIDIUM_TESTNET: [
+        ("0xa6B71E26C5e0845f74c812102Ca7114b6a896AB2", 761231),  # v1.3.0
+    ],
+    EthereumNetwork.GODWOKEN_TESTNET: [
+        ("0xC22834581EbC8527d974F8a1c97E1bEA4EF910BC", 93108),  # v1.3.0
     ],
 }
 
