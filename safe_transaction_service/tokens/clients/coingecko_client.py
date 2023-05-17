@@ -37,7 +37,7 @@ class CoingeckoClient:
             self.asset_platform = "optimistic-ethereum"
         elif network == EthereumNetwork.GNOSIS:
             self.asset_platform = "xdai"
-        elif network == EthereumNetwork.CRONOS_MAINNET:
+        elif network == EthereumNetwork.CRONOS_MAINNET_BETA:
             self.asset_platform = "cronos"
         elif network == EthereumNetwork.FUSE_MAINNET:
             self.asset_platform = "fuse"
@@ -59,7 +59,7 @@ class CoingeckoClient:
             EthereumNetwork.MATIC,
             EthereumNetwork.OPTIMISTIC,
             EthereumNetwork.XDAI,
-            EthereumNetwork.CRONOS_MAINNET,
+            EthereumNetwork.CRONOS_MAINNET_BETA,
             EthereumNetwork.POLYGON,
             EthereumNetwork.OPTIMISM,
             EthereumNetwork.GNOSIS,
