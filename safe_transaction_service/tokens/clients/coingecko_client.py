@@ -11,6 +11,7 @@ from gnosis.eth import EthereumNetwork
 from safe_transaction_service.tokens.clients.exceptions import (
     CannotGetPrice,
     Coingecko404,
+    CoingeckoRateLimitError,
     CoingeckoRequestError,
 )
 
@@ -22,40 +23,49 @@ class CoingeckoClient:
 
     def __init__(self, network: Optional[EthereumNetwork] = None):
         self.http_session = requests.Session()
-        if network == EthereumNetwork.ARBITRUM:
+        if network == EthereumNetwork.ARBITRUM_ONE:
             self.asset_platform = "arbitrum-one"
-        elif network == EthereumNetwork.AURORA:
+        elif network == EthereumNetwork.AURORA_MAINNET:
             self.asset_platform = "aurora"
-        elif network == EthereumNetwork.AVALANCHE:
+        elif network == EthereumNetwork.AVALANCHE_C_CHAIN:
             self.asset_platform = "avalanche"
-        elif network == EthereumNetwork.BINANCE:
+        elif network == EthereumNetwork.BINANCE_SMART_CHAIN_MAINNET:
             self.asset_platform = "binance-smart-chain"
-        elif network == EthereumNetwork.MATIC:
+        elif network == EthereumNetwork.POLYGON:
             self.asset_platform = "polygon-pos"
-        elif network == EthereumNetwork.OPTIMISTIC:
+        elif network == EthereumNetwork.OPTIMISM:
             self.asset_platform = "optimistic-ethereum"
-        elif network == EthereumNetwork.XDAI:
+        elif network == EthereumNetwork.GNOSIS:
             self.asset_platform = "xdai"
-        elif network == EthereumNetwork.CRONOS_MAINNET:
+        elif network == EthereumNetwork.CRONOS_MAINNET_BETA:
             self.asset_platform = "cronos"
         elif network == EthereumNetwork.FUSE_MAINNET:
             self.asset_platform = "fuse"
+        elif network == EthereumNetwork.KCC_MAINNET:
+            self.asset_platform = "kucoin-community-chain"
+        elif network == EthereumNetwork.METIS_ANDROMEDA_MAINNET:
+            self.asset_platform = "metis-andromeda"
         else:
             self.asset_platform = "ethereum"
 
     @staticmethod
     def supports_network(network: EthereumNetwork):
         return network in (
-            EthereumNetwork.ARBITRUM,
-            EthereumNetwork.AURORA,
-            EthereumNetwork.AVALANCHE,
-            EthereumNetwork.BINANCE,
+            EthereumNetwork.ARBITRUM_ONE,
+            EthereumNetwork.AURORA_MAINNET,
+            EthereumNetwork.AVALANCHE_C_CHAIN,
+            EthereumNetwork.BINANCE_SMART_CHAIN_MAINNET,
             EthereumNetwork.MAINNET,
             EthereumNetwork.MATIC,
             EthereumNetwork.OPTIMISTIC,
             EthereumNetwork.XDAI,
-            EthereumNetwork.CRONOS_MAINNET,
+            EthereumNetwork.CRONOS_MAINNET_BETA,
+            EthereumNetwork.POLYGON,
+            EthereumNetwork.OPTIMISM,
+            EthereumNetwork.GNOSIS,
             EthereumNetwork.FUSE_MAINNET,
+            EthereumNetwork.KCC_MAINNET,
+            EthereumNetwork.METIS_ANDROMEDA_MAINNET,
         )
 
     def _do_request(self, url: str) -> Dict[str, Any]:
@@ -63,7 +73,9 @@ class CoingeckoClient:
             response = self.http_session.get(url, timeout=10)
             if not response.ok:
                 if response.status_code == 404:
-                    raise Coingecko404
+                    raise Coingecko404(url)
+                if response.status_code == 429:
+                    raise CoingeckoRateLimitError(url)
                 raise CoingeckoRequestError(url)
             return response.json()
         except (ValueError, IOError) as e:
@@ -127,6 +139,9 @@ class CoingeckoClient:
         if token_info:
             return token_info["image"]["large"]
 
+    def get_ada_usd_price(self) -> float:
+        return self.get_price("cardano")
+
     def get_avax_usd_price(self) -> float:
         return self.get_price("avalanche-2")
 
@@ -150,3 +165,9 @@ class CoingeckoClient:
 
     def get_fuse_usd_price(self) -> float:
         return self.get_price("fuse-network-token")
+
+    def get_kcs_usd_price(self) -> float:
+        return self.get_price("kucoin-shares")
+
+    def get_metis_usd_price(self) -> float:
+        return self.get_price("metis-token")

@@ -22,12 +22,33 @@ class KucoinClient:
             logger.warning("Cannot get price from url=%s", url)
             raise CannotGetPrice from e
 
-    def get_ewt_usd_price(self) -> float:
+    def get_eth_usd_price(self) -> float:
         """
-        :return: current USD price for Energy Web Token
+        :return: current USD price for ETH Coin
         :raises: CannotGetPrice
         """
-        return self._get_price("EWT-USDT")
+        return self._get_price("ETH-USDT")
+
+    def get_aurora_usd_price(self) -> float:
+        """
+        :return: current USD price for Aurora Coin
+        :raises: CannotGetPrice
+        """
+        return self._get_price("AURORA-USDT")
+
+    def get_bnb_usd_price(self) -> float:
+        """
+        :return: current USD price for Binance Coin
+        :raises: CannotGetPrice
+        """
+        return self._get_price("BNB-USDT")
+
+    def get_celo_usd_price(self) -> float:
+        """
+        :return: current USD price for Celo
+        :raises: CannotGetPrice
+        """
+        return self._get_price("CELO-USDT")
 
     def get_cro_usd_price(self) -> float:
         """
@@ -35,3 +56,31 @@ class KucoinClient:
         :raises: CannotGetPrice
         """
         return self._get_price("CRO-USDT")
+
+    def get_ewt_usd_price(self) -> float:
+        """
+        :return: current USD price for Energy Web Token
+        :raises: CannotGetPrice
+        """
+        return self._get_price("EWT-USDT")
+
+    def get_kcs_usd_price(self) -> float:
+        """
+        :return: current USD price for KuCoin Token
+        :raises: CannotGetPrice
+        """
+        return self._get_price("KCS-USDT")
+
+    def get_matic_usd_price(self) -> float:
+        """
+        :return: current USD price for MATIC Token
+        :raises: CannotGetPrice
+        """
+        return self._get_price("MATIC-USDT")
+
+    def get_xdc_usd_price(self) -> float:
+        """
+        :return: current USD price for XDC Token
+        :raises: CannotGetPrice
+        """
+        return self._get_price("XDC-USDT")

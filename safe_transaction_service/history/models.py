@@ -7,7 +7,7 @@ from logging import getLogger
 from typing import (
     Any,
     Dict,
-    Iterable,
+    Iterator,
     List,
     Optional,
     Sequence,
@@ -107,6 +107,10 @@ class InternalTxType(Enum):
             raise ValueError(f"{tx_type} is not a valid InternalTxType")
 
 
+class IndexingStatusType(Enum):
+    ERC20_721_EVENTS = 0
+
+
 class TransferDict(TypedDict):
     block_number: int
     transaction_hash: HexBytes
@@ -131,24 +135,61 @@ class BulkCreateSignalMixin:
         return result
 
     def bulk_create_from_generator(
-        self, objs: Iterable[Any], batch_size: int = 100, ignore_conflicts: bool = False
+        self, objs: Iterator[Any], batch_size: int = 100, ignore_conflicts: bool = False
     ) -> int:
         """
         Implementation in Django is not ok, as it will do `objs = list(objs)`. If objects come from a generator
         they will be brought to RAM. This approach is more friendly
+
         :return: Count of inserted elements
         """
         assert batch_size is not None and batch_size > 0
+        iterator = iter(
+            objs
+        )  # Make sure we are not slicing the same elements if a sequence is provided
         total = 0
         while True:
             if inserted := len(
                 self.bulk_create(
-                    islice(objs, batch_size), ignore_conflicts=ignore_conflicts
+                    islice(iterator, batch_size), ignore_conflicts=ignore_conflicts
                 )
             ):
                 total += inserted
             else:
                 return total
+
+
+class IndexingStatusManager(models.Manager):
+    def get_erc20_721_indexing_status(self) -> "IndexingStatus":
+        return self.get(indexing_type=IndexingStatusType.ERC20_721_EVENTS.value)
+
+    def set_erc20_721_indexing_status(self, block_number: int) -> bool:
+        return bool(
+            self.filter(indexing_type=IndexingStatusType.ERC20_721_EVENTS.value).update(
+                block_number=block_number
+            )
+        )
+
+
+class IndexingStatus(models.Model):
+    objects = IndexingStatusManager()
+    indexing_type = models.PositiveSmallIntegerField(
+        primary_key=True,
+        choices=[(tag.value, tag.name) for tag in IndexingStatusType],
+    )
+    block_number = models.PositiveIntegerField(db_index=True)
+
+
+class Chain(models.Model):
+    """
+    This model keeps track of the chainId used to configure the service, to prevent issues if a wrong ethereum
+    RPC is configured later
+    """
+
+    chain_id = models.BigIntegerField(primary_key=True)
+
+    def __str__(self):
+        return f"ChainId {self.chain_id}"
 
 
 class EthereumBlockManager(models.Manager):
@@ -170,7 +211,8 @@ class EthereumBlockManager(models.Manager):
             with transaction.atomic():  # Needed for handling IntegrityError
                 return super().create(
                     number=block["number"],
-                    gas_limit=block["gasLimit"],
+                    # Some networks like CELO don't provide gasLimit
+                    gas_limit=block.get("gasLimit", 0),
                     gas_used=block["gasUsed"],
                     timestamp=datetime.datetime.fromtimestamp(
                         block["timestamp"], datetime.timezone.utc
@@ -235,7 +277,16 @@ class EthereumBlock(models.Model):
     block_hash = Keccak256Field(unique=True)
     parent_hash = Keccak256Field(unique=True)
     # For reorgs, True if `current_block_number` - `number` >= MIN_CONFIRMATIONS
-    confirmed = models.BooleanField(default=False, db_index=True)
+    confirmed = models.BooleanField(default=False)
+
+    class Meta:
+        indexes = [
+            Index(
+                name="history_block_confirmed_idx",
+                fields=["confirmed"],
+                condition=Q(confirmed=False),
+            ),
+        ]
 
     def __str__(self):
         return f"Block number={self.number} on {self.timestamp}"
@@ -263,14 +314,21 @@ class EthereumTxManager(models.Manager):
         logs = tx_receipt and [
             clean_receipt_log(log) for log in tx_receipt.get("logs", [])
         ]
+
+        # Some networks like CELO provide a `null` gas_price
+        gas_price = (
+            (tx_receipt and tx_receipt.get("effectiveGasPrice", 0))
+            or tx.get("gasPrice", 0)
+            or 0
+        )
+
         return super().create(
             block=ethereum_block,
             tx_hash=HexBytes(tx["hash"]).hex(),
             gas_used=tx_receipt and tx_receipt["gasUsed"],
             _from=tx["from"],
             gas=tx["gas"],
-            gas_price=(tx_receipt and tx_receipt.get("effectiveGasPrice", 0))
-            or tx.get("gasPrice", 0),
+            gas_price=gas_price,
             max_fee_per_gas=tx.get("maxFeePerGas"),
             max_priority_fee_per_gas=tx.get("maxPriorityFeePerGas"),
             logs=logs,
@@ -811,7 +869,9 @@ class InternalTx(models.Model):
     )  # For SELF-DESTRUCT it can be null
     gas = Uint256Field()
     data = models.BinaryField(null=True)  # `input` for Call, `init` for Create
-    to = EthereumAddressV2Field(null=True)
+    to = EthereumAddressV2Field(
+        null=True
+    )  # Already exists a multicolumn index for field
     value = Uint256Field()
     gas_used = Uint256Field()
     contract_address = EthereumAddressV2Field(null=True, db_index=True)  # Create
@@ -1164,6 +1224,9 @@ class MultisigTransactionQuerySet(models.QuerySet):
     def trusted(self):
         return self.filter(trusted=True)
 
+    def not_trusted(self):
+        return self.filter(trusted=False)
+
     def multisend(self):
         # TODO Use MultiSend.MULTISEND_ADDRESSES + MultiSend MULTISEND_CALL_ONLY_ADDRESSES
         return self.filter(
@@ -1181,13 +1244,25 @@ class MultisigTransactionQuerySet(models.QuerySet):
 
         :return: queryset with `confirmations_required: int` field
         """
-        threshold_query = (
+        threshold_safe_status_query = (
             SafeStatus.objects.filter(internal_tx__ethereum_tx=OuterRef("ethereum_tx"))
             .sorted_reverse_by_mined()
             .values("threshold")
         )
 
-        return self.annotate(confirmations_required=Subquery(threshold_query[:1]))
+        threshold_safe_last_status_query = SafeLastStatus.objects.filter(
+            address=OuterRef("safe")
+        ).values("threshold")
+
+        threshold_queries = Case(
+            When(
+                ethereum_tx__isnull=True,
+                then=Subquery(threshold_safe_last_status_query[:1]),
+            ),
+            default=Subquery(threshold_safe_status_query[:1]),
+        )
+
+        return self.annotate(confirmations_required=threshold_queries)
 
     def queued(self, safe_address: str):
         """
@@ -1238,9 +1313,7 @@ class MultisigTransaction(TimeStampedModel):
     signatures = models.BinaryField(null=True, blank=True)  # When tx is executed
     nonce = Uint256Field(db_index=True)
     failed = models.BooleanField(null=True, blank=True, default=None, db_index=True)
-    origin = models.CharField(
-        null=True, blank=True, default=None, max_length=200
-    )  # To store arbitrary data on the tx
+    origin = models.JSONField(default=dict)  # To store arbitrary data on the tx
     trusted = models.BooleanField(
         default=False, db_index=True
     )  # Txs proposed by a delegate or with one confirmation
@@ -1470,9 +1543,6 @@ class SafeContract(models.Model):
     ethereum_tx = models.ForeignKey(
         EthereumTx, on_delete=models.CASCADE, related_name="safe_contracts"
     )
-    erc20_block_number = models.IntegerField(
-        default=0, db_index=True
-    )  # Block number of last scan of erc20
 
     def __str__(self):
         return f"Safe address={self.address} - ethereum-tx={self.ethereum_tx_id}"
@@ -1575,12 +1645,12 @@ class SafeStatusBase(models.Model):
 
         :return: `True` if corrupted, `False` otherwise
         """
-        return (
+        safe_status_count = (
             SafeStatus.objects.distinct("nonce")
             .filter(address=self.address, nonce__lte=self.nonce)
             .count()
-            <= self.nonce
         )
+        return safe_status_count and safe_status_count <= self.nonce
 
     @classmethod
     def from_status_instance(
