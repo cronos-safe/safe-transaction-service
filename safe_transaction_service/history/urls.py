@@ -18,7 +18,8 @@ urlpatterns = [
     ),
     path(
         "about/master-copies/", views.MasterCopiesView.as_view(), name="master-copies"
-    ),
+    ),  # Deprecated
+    path("about/singletons/", views.SingletonsView.as_view(), name="singletons"),
     path(
         "about/indexing/",
         views.IndexingView.as_view(),
@@ -63,6 +64,16 @@ urlpatterns = [
         name="transfers",
     ),
     path(
+        "transfer/<str:transfer_id>",
+        views.TransferView.as_view(),
+        name="transfer",
+    ),
+    path(
+        "module-transaction/<str:module_transaction_id>",
+        views.ModuleTransactionView.as_view(),
+        name="module-transaction",
+    ),
+    path(
         "safes/<str:address>/module-transactions/",
         views.SafeModuleTransactionListView.as_view(),
         name="module-transactions",
@@ -81,11 +92,6 @@ urlpatterns = [
         "safes/<str:address>/balances/usd/",
         views.SafeBalanceUsdView.as_view(),
         name="safe-balances-usd",
-    ),
-    path(
-        "safes/<str:address>/delegates/",
-        views.SafeDelegateListView.as_view(),
-        name="safe-delegates",
     ),
     path(
         "safes/<str:address>/delegates/<str:delegate_address>/",

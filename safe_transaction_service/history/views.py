@@ -1,6 +1,7 @@
 import hashlib
 import logging
-from typing import Any, Dict, Tuple
+import pickle
+from typing import Any, Dict, Optional, Tuple
 
 from django.conf import settings
 from django.utils.decorators import method_decorator
@@ -9,6 +10,7 @@ from django.views.decorators.cache import cache_page
 import django_filters
 from drf_yasg import openapi
 from drf_yasg.utils import swagger_auto_schema
+from eth_typing import ChecksumAddress, HexStr
 from rest_framework import status
 from rest_framework.filters import OrderingFilter
 from rest_framework.generics import (
@@ -23,16 +25,18 @@ from rest_framework.renderers import JSONRenderer
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from gnosis.eth import EthereumClient, EthereumClientProvider
+from gnosis.eth import EthereumClient, EthereumClientProvider, EthereumNetwork
 from gnosis.eth.constants import NULL_ADDRESS
 from gnosis.eth.utils import fast_is_checksum_address
 from gnosis.safe import CannotEstimateGas
 
 from safe_transaction_service import __version__
-from safe_transaction_service.tokens.models import Token
+from safe_transaction_service.utils.ethereum import get_chain_id
 from safe_transaction_service.utils.utils import parse_boolean_query_param
 
+from ..utils.redis import get_redis
 from . import filters, pagination, serializers
+from .helpers import add_tokens_to_transfers, is_valid_unique_transfer_id
 from .models import (
     ERC20Transfer,
     ERC721Transfer,
@@ -46,6 +50,7 @@ from .models import (
     SafeMasterCopy,
     TransferDict,
 )
+from .pagination import DummyPagination
 from .serializers import get_data_decoded_from_data
 from .services import (
     BalanceServiceProvider,
@@ -65,7 +70,7 @@ class AboutView(APIView):
 
     renderer_classes = (JSONRenderer,)
 
-    @method_decorator(cache_page(60 * 60))  # 1 hour
+    @method_decorator(cache_page(5 * 60))  # 5 minutes
     def get(self, request, format=None):
         content = {
             "name": "Safe Transaction Service",
@@ -106,7 +111,7 @@ class AboutEthereumRPCView(APIView):
 
     def _get_info(self, ethereum_client: EthereumClient) -> Dict[str, Any]:
         try:
-            client_version = ethereum_client.w3.clientVersion
+            client_version = ethereum_client.w3.client_version
         except (IOError, ValueError):
             client_version = "Error getting client version"
 
@@ -115,11 +120,12 @@ class AboutEthereumRPCView(APIView):
         except (IOError, ValueError):
             syncing = "Error getting syncing status"
 
-        ethereum_network = ethereum_client.get_network()
+        ethereum_chain_id = get_chain_id()
+        ethereum_network = EthereumNetwork(ethereum_chain_id)
         return {
             "version": client_version,
             "block_number": ethereum_client.current_block_number,
-            "chain_id": ethereum_network.value,
+            "chain_id": ethereum_chain_id,
             "chain": ethereum_network.name,
             "syncing": syncing,
         }
@@ -161,7 +167,7 @@ class IndexingView(GenericAPIView):
         return Response(status=status.HTTP_200_OK, data=serializer.data)
 
 
-class MasterCopiesView(ListAPIView):
+class SingletonsView(ListAPIView):
     serializer_class = serializers.MasterCopyResponseSerializer
     pagination_class = None
 
@@ -169,12 +175,25 @@ class MasterCopiesView(ListAPIView):
         return SafeMasterCopy.objects.relevant()
 
 
+class MasterCopiesView(SingletonsView):
+    @swagger_auto_schema(
+        deprecated=True,
+        operation_description="Use `singletons` instead of `master-copies`",
+        responses={200: "Ok"},
+    )
+    def get(self, *args, **kwargs):
+        return super().get(*args, **kwargs)
+
+
 class AllTransactionsListView(ListAPIView):
     filter_backends = (
         django_filters.rest_framework.DjangoFilterBackend,
         OrderingFilter,
     )
-    ordering_fields = ["execution_date", "safe_nonce", "block", "created"]
+    ordering_fields = ["execution_date"]
+    allowed_ordering_fields = ordering_fields + [
+        f"-{ordering_field}" for ordering_field in ordering_fields
+    ]
     pagination_class = pagination.SmallPagination
     serializer_class = (
         serializers.AllTransactionsSchemaSerializer
@@ -228,23 +247,166 @@ class AllTransactionsListView(ListAPIView):
         )
         return executed, queued, trusted
 
-    def list(self, request, *args, **kwargs):
+    def get_ordering_parameter(self) -> Optional[str]:
+        return self.request.query_params.get(OrderingFilter.ordering_param)
+
+    def get_page_tx_identifiers(
+        self,
+        safe: ChecksumAddress,
+        executed: bool,
+        queued: bool,
+        trusted: bool,
+        ordering: Optional[str],
+        limit: int,
+        offset: int,
+    ) -> Optional[Response]:
+        """
+        This query will merge txs and events and will return the important
+        identifiers (``safeTxHash`` or ``txHash``) filtered
+
+        :param safe:
+        :param executed:
+        :param queued:
+        :param trusted:
+        :param ordering:
+        :param limit:
+        :param offset:
+        :return: Return tx identifiers paginated
+        """
         transaction_service = TransactionServiceProvider()
-        safe = self.kwargs["address"]
-        executed, queued, trusted = self.get_parameters()
+
+        logger.debug(
+            "%s: Getting all tx identifiers for Safe=%s executed=%s queued=%s trusted=%s ordering=%s limit=%d offset=%d",
+            self.__class__.__name__,
+            safe,
+            executed,
+            queued,
+            trusted,
+            ordering,
+            limit,
+            offset,
+        )
         queryset = self.filter_queryset(
-            transaction_service.get_all_tx_hashes(
+            transaction_service.get_all_tx_identifiers(
                 safe, executed=executed, queued=queued, trusted=trusted
             )
         )
         page = self.paginate_queryset(queryset)
+        logger.debug(
+            "%s: Got all tx identifiers for Safe=%s executed=%s queued=%s trusted=%s ordering=%s limit=%d offset=%d",
+            self.__class__.__name__,
+            safe,
+            executed,
+            queued,
+            trusted,
+            ordering,
+            limit,
+            offset,
+        )
 
-        if not page:
+        return page
+
+    def get_cached_page_tx_identifiers(
+        self,
+        safe: ChecksumAddress,
+        executed: bool,
+        queued: bool,
+        trusted: bool,
+        ordering: Optional[str],
+        limit: int,
+        offset: int,
+    ) -> Optional[Response]:
+        """
+        Cache for tx identifiers. A quick ``SQL COUNT`` in all the transactions/events
+        tables will determinate if cache for the provided values is still valid or not
+
+        :param safe:
+        :param executed:
+        :param queued:
+        :param trusted:
+        :param ordering:
+        :param limit:
+        :param offset:
+        :return:
+        """
+        transaction_service = TransactionServiceProvider()
+        cache_timeout = settings.CACHE_ALL_TXS_VIEW
+        redis = get_redis()
+
+        # Get all relevant elements for a Safe to be cached
+        relevant_elements = transaction_service.get_count_relevant_txs_for_safe(safe)
+        cache_key = f"all-txs:{safe}:{int(executed)}{int(queued)}{int(trusted)}:{limit}:{offset}:{ordering}:{relevant_elements}"
+        lock_key = f"locks:{cache_key}"
+
+        if not cache_timeout:
+            # Cache disabled
+            return self.get_page_tx_identifiers(
+                safe, executed, queued, trusted, ordering, limit, offset
+            )
+
+        with redis.lock(
+            lock_key,
+            timeout=settings.GUNICORN_REQUEST_TIMEOUT,  # This prevents a service restart to leave a lock forever
+        ):
+            if result := redis.get(cache_key):
+                # Count needs to be retrieved to set it up the paginator
+                page, count = pickle.loads(result)
+                # Setting the paginator like this is not very elegant and needs to be tested really well
+                self.paginator.count = count
+                self.paginator.limit = limit
+                self.paginator.offset = offset
+                self.paginator.request = self.request
+                return page
+
+            page = self.get_page_tx_identifiers(
+                safe, executed, queued, trusted, ordering, limit, offset
+            )
+            redis.set(
+                cache_key, pickle.dumps((page, self.paginator.count)), ex=cache_timeout
+            )
+
+            return page
+
+    def list(self, request, *args, **kwargs):
+        transaction_service = TransactionServiceProvider()
+        safe = self.kwargs["address"]
+        executed, queued, trusted = self.get_parameters()
+        ordering = self.get_ordering_parameter()
+        # Trick to get limit and offset
+        list_pagination = DummyPagination(self.request)
+        limit, offset = list_pagination.limit, list_pagination.offset
+
+        tx_identifiers_page = self.get_cached_page_tx_identifiers(
+            safe, executed, queued, trusted, ordering, limit, offset
+        )
+        if not tx_identifiers_page:
             return self.get_paginated_response([])
 
-        all_tx_hashes = [element["safe_tx_hash"] for element in page]
-        all_txs = transaction_service.get_all_txs_from_hashes(safe, all_tx_hashes)
+        # Tx identifiers are retrieved using `safe_tx_hash` attribute name due to how Django
+        # handles `UNION` of all the Transaction models using the first model attribute name
+        all_tx_identifiers = [
+            element["safe_tx_hash"] for element in tx_identifiers_page
+        ]
+        all_txs = transaction_service.get_all_txs_from_identifiers(
+            safe, all_tx_identifiers
+        )
+        logger.debug(
+            "%s: Got all txs from identifiers for Safe=%s executed=%s queued=%s trusted=%s",
+            self.__class__.__name__,
+            safe,
+            executed,
+            queued,
+            trusted,
+        )
         all_txs_serialized = transaction_service.serialize_all_txs(all_txs)
+        logger.debug(
+            "%s: All txs from identifiers for Safe=%s executed=%s queued=%s trusted=%s were serialized",
+            self.__class__.__name__,
+            safe,
+            executed,
+            queued,
+            trusted,
+        )
         return self.get_paginated_response(all_txs_serialized)
 
     @swagger_auto_schema(
@@ -268,7 +430,7 @@ class AllTransactionsListView(ListAPIView):
         by a delegate). If you need that behaviour to be disabled set the query parameter `trusted=False`
         - Module Transactions for a Safe. `tx_type=MODULE_TRANSACTION`
         - Incoming Transfers of Ether/ERC20 Tokens/ERC721 Tokens. `tx_type=ETHEREUM_TRANSACTION`
-        Ordering_fields: ["execution_date", "safe_nonce", "block", "created"] eg: `created` or `-created`
+        Ordering_fields: ["execution_date"] eg: `execution_date` or `-execution_date`
         """
         address = kwargs["address"]
         if not fast_is_checksum_address(address):
@@ -280,6 +442,16 @@ class AllTransactionsListView(ListAPIView):
                     "arguments": [address],
                 },
             )
+        ordering = self.get_ordering_parameter()
+        if ordering and ordering not in self.allowed_ordering_fields:
+            return Response(
+                status=status.HTTP_400_BAD_REQUEST,
+                data={
+                    "code": 1,
+                    "message": "Ordering field is not valid, only `execution_date` is allowed",
+                    "arguments": [ordering],
+                },
+            )
 
         response = super().get(request, *args, **kwargs)
         response.setdefault(
@@ -287,6 +459,46 @@ class AllTransactionsListView(ListAPIView):
             "W/" + hashlib.md5(str(response.data["results"]).encode()).hexdigest(),
         )
         return response
+
+
+class ModuleTransactionView(RetrieveAPIView):
+    serializer_class = serializers.SafeModuleTransactionResponseSerializer
+    pagination_class = None  # Don't show limit/offset in swagger
+
+    @swagger_auto_schema(
+        responses={
+            200: serializer_class(),
+            404: "ModuleTransaction does not exist",
+            400: "Invalid moduleTransactionId",
+        }
+    )
+    @method_decorator(cache_page(60 * 60))  # 1 hour
+    def get(self, request, module_transaction_id: str, *args, **kwargs) -> Response:
+        """
+        :return: module transaction filtered by module_transaction_id
+        """
+        if module_transaction_id and not is_valid_unique_transfer_id(
+            module_transaction_id
+        ):
+            return Response(
+                status=status.HTTP_400_BAD_REQUEST,
+                data={
+                    "code": 1,
+                    "message": "module_transaction_id is not valid",
+                    "arguments": [module_transaction_id],
+                },
+            )
+        tx_hash = module_transaction_id[1:65]
+        trace_address = module_transaction_id[65:]
+        try:
+            module_transaction = ModuleTransaction.objects.get(
+                internal_tx__ethereum_tx_id=tx_hash,
+                internal_tx__trace_address=trace_address,
+            )
+            serializer = self.get_serializer(module_transaction)
+            return Response(status=status.HTTP_200_OK, data=serializer.data)
+        except ModuleTransaction.DoesNotExist:
+            return Response(status=status.HTTP_404_NOT_FOUND)
 
 
 class SafeModuleTransactionListView(ListAPIView):
@@ -375,6 +587,60 @@ class SafeMultisigTransactionDetailView(RetrieveAPIView):
             .select_related("ethereum_tx__block")
         )
 
+    @swagger_auto_schema(
+        request_body=serializers.SafeMultisigTransactionDeleteSerializer(),
+        responses={
+            204: "Deleted",
+            404: "Transaction not found",
+            400: "Error processing data",
+        },
+    )
+    def delete(self, request, safe_tx_hash: HexStr):
+        """
+        Delete a queued but not executed multisig transaction. Only the proposer can delete the transaction.
+        Delegates are not valid, if the transaction was proposed by a delegator the owner who delegated to
+        the delegate must be used.
+        An EOA is required to sign the following EIP712 data:
+
+        ```python
+         {
+            "types": {
+                "EIP712Domain": [
+                    {"name": "name", "type": "string"},
+                    {"name": "version", "type": "string"},
+                    {"name": "chainId", "type": "uint256"},
+                    {"name": "verifyingContract", "type": "address"},
+                ],
+                "DeleteRequest": [
+                    {"name": "safeTxHash", "type": "bytes32"},
+                    {"name": "totp", "type": "uint256"},
+                ],
+            },
+            "primaryType": "DeleteRequest",
+            "domain": {
+                "name": "Safe Transaction Service",
+                "version": "1.0",
+                "chainId": chain_id,
+                "verifyingContract": safe_address,
+            },
+            "message": {
+                "safeTxHash": safe_tx_hash,
+                "totp": totp,
+            },
+        }
+        ```
+
+        `totp` parameter is calculated with `T0=0` and `Tx=3600`. `totp` is calculated by taking the
+        Unix UTC epoch time (no milliseconds) and dividing by 3600 (natural division, no decimals)
+        """
+        request.data["safe_tx_hash"] = safe_tx_hash
+        serializer = serializers.SafeMultisigTransactionDeleteSerializer(
+            data=request.data
+        )
+        serializer.is_valid(raise_exception=True)
+        MultisigTransaction.objects.filter(safe_tx_hash=safe_tx_hash).delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
 
 class SafeMultisigTransactionDeprecatedDetailView(SafeMultisigTransactionDetailView):
     @swagger_auto_schema(
@@ -405,9 +671,17 @@ class SafeMultisigTransactionListView(ListAPIView):
         )
 
     def get_unique_nonce(self, address: str):
-        return (
-            MultisigTransaction.objects.filter(safe=address).distinct("nonce").count()
+        """
+        :param address:
+        :return: Number of Multisig Transactions with different nonce
+        """
+        only_trusted = parse_boolean_query_param(
+            self.request.query_params.get("trusted", True)
         )
+        queryset = MultisigTransaction.objects.filter(safe=address)
+        if only_trusted:
+            queryset = queryset.filter(trusted=True)
+        return queryset.distinct("nonce").count()
 
     def get_serializer_class(self):
         """
@@ -423,7 +697,8 @@ class SafeMultisigTransactionListView(ListAPIView):
     )
     def get(self, request, *args, **kwargs):
         """
-        Returns the history of a multisig tx (safe)
+        Returns a paginated list of Multisig Transactions for a Safe.
+        By default only ``trusted`` multisig transactions are returned.
         """
         address = kwargs["address"]
         if not fast_is_checksum_address(address):
@@ -581,111 +856,6 @@ class SafeBalanceUsdView(SafeBalanceView):
         return super().get(*args, **kwargs)
 
 
-class SafeDelegateListView(ListCreateAPIView):
-    pagination_class = pagination.DefaultPagination
-
-    def get_queryset(self):
-        return SafeContractDelegate.objects.filter(
-            safe_contract_id=self.kwargs["address"]
-        )
-
-    def get_serializer_class(self):
-        if self.request.method == "GET":
-            return serializers.SafeDelegateResponseSerializer
-        elif self.request.method == "POST":
-            return serializers.SafeDelegateSerializer
-        elif self.request.method == "DELETE":
-            return serializers.SafeDelegateDeleteSerializer
-
-    @swagger_auto_schema(
-        deprecated=True,
-        operation_description="Use /delegates endpoint",
-        responses={400: "Invalid data", 422: "Invalid Ethereum address"},
-    )
-    def get(self, request, address, **kwargs):
-        """
-        Get the list of delegates for a Safe address
-        """
-        if not fast_is_checksum_address(address):
-            return Response(
-                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                data={
-                    "code": 1,
-                    "message": "Checksum address validation failed",
-                    "arguments": [address],
-                },
-            )
-
-        return super().get(request, address, **kwargs)
-
-    @swagger_auto_schema(
-        deprecated=True,
-        operation_description="Use /delegates endpoint",
-        responses={
-            202: "Accepted",
-            400: "Malformed data",
-            422: "Invalid Ethereum address/Error processing data",
-        },
-    )
-    def post(self, request, address, **kwargs):
-        """
-        Create a delegate for a Safe address with a custom label. Calls with same delegate but different label or
-        signer will update the label or delegator if different.
-        For the signature we are using TOTP with `T0=0` and `Tx=3600`. TOTP is calculated by taking the
-        Unix UTC epoch time (no milliseconds) and dividing by 3600 (natural division, no decimals)
-        For signature this hash need to be signed: keccak(checksummed address + str(int(current_epoch // 3600)))
-        For example:
-             - We want to add the delegate `0x132512f995866CcE1b0092384A6118EDaF4508Ff` and `epoch=1586779140`.
-             - `TOTP = epoch // 3600 = 1586779140 // 3600 = 440771`
-             - The hash to sign by a Safe owner would be `keccak("0x132512f995866CcE1b0092384A6118EDaF4508Ff440771")`
-        """
-        if not fast_is_checksum_address(address):
-            return Response(
-                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                data={
-                    "code": 1,
-                    "message": "Checksum address validation failed",
-                    "arguments": [address],
-                },
-            )
-
-        request.data["safe"] = address
-        return super().post(request, address, **kwargs)
-
-    @swagger_auto_schema(
-        operation_id="safes_delegates_delete_all",
-        deprecated=True,
-        operation_description="Use /delegates endpoint",
-        responses={
-            204: "Deleted",
-            400: "Malformed data",
-            422: "Invalid Ethereum address/Error processing data",
-        },
-    )
-    def delete(self, request, address, *args, **kwargs):
-        """
-        Delete all delegates for a Safe. Signature is built the same way that for adding a delegate using the Safe
-        address as the delegate.
-
-        Check `POST /delegates/`
-        """
-        if not fast_is_checksum_address(address):
-            return Response(
-                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                data={
-                    "code": 1,
-                    "message": "Checksum address validation failed",
-                    "arguments": [address],
-                },
-            )
-        request.data["safe"] = address
-        request.data["delegate"] = address
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        SafeContractDelegate.objects.filter(safe_contract_id=address).delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
-
-
 class SafeDelegateDestroyView(DestroyAPIView):
     serializer_class = serializers.SafeDelegateDeleteSerializer
 
@@ -818,26 +988,98 @@ class DelegateDeleteView(GenericAPIView):
             return Response(status=status.HTTP_404_NOT_FOUND)
 
 
+class TransferView(RetrieveAPIView):
+    serializer_class = serializers.TransferWithTokenInfoResponseSerializer
+    pagination_class = None
+
+    def get_erc20_erc721_transfer(
+        self, transaction_hash: HexStr, log_index: int
+    ) -> TransferDict:
+        """
+        Search ERCTransfer by transaction_hash and log_index event.
+
+        :param transaction_hash: ethereum transaction hash
+        :param log_index: event log index
+        :return: transfer
+        """
+        erc20_queryset = self.filter_queryset(
+            ERC20Transfer.objects.filter(
+                ethereum_tx=transaction_hash, log_index=log_index
+            ).token_txs()
+        )
+        erc721_queryset = self.filter_queryset(
+            ERC721Transfer.objects.filter(
+                ethereum_tx=transaction_hash, log_index=log_index
+            ).token_txs()
+        )
+        return ERC20Transfer.objects.token_transfer_values(
+            erc20_queryset, erc721_queryset
+        )
+
+    def get_ethereum_transfer(
+        self, transaction_hash: HexStr, trace_address: str
+    ) -> TransferDict:
+        """
+        Search an ethereum transfer by transaction hash and trace address
+
+        :param transaction_hash: ethereum transaction hash
+        :param trace_address: ethereum trace address
+        :return: transfer
+        """
+        ether_queryset = self.filter_queryset(
+            InternalTx.objects.ether_txs().filter(
+                ethereum_tx=transaction_hash, trace_address=trace_address
+            )
+        )
+        return InternalTx.objects.ether_txs_values(ether_queryset)
+
+    def get_queryset(self, transfer_id: str) -> TransferDict:
+        # transfer_id is composed by transfer_type (ethereum transfer or token_transfer) + tx_hash + (log_index or trace_address)
+        transfer_type = transfer_id[0]
+        tx_hash = transfer_id[1:65]
+        if transfer_type == "i":
+            # It is an ethereumTransfer
+            trace_address = transfer_id[65:]
+            return self.get_ethereum_transfer(tx_hash, trace_address)
+        else:
+            # It is an tokenTransfer
+            log_index = int(transfer_id[65:])
+            return self.get_erc20_erc721_transfer(tx_hash, log_index)
+
+    @swagger_auto_schema(
+        responses={
+            200: serializers.TransferWithTokenInfoResponseSerializer(),
+            404: "Transfer does not exist",
+            400: "Invalid transferId",
+        }
+    )
+    @method_decorator(cache_page(60 * 60))  # 1 hour
+    def get(self, request, transfer_id: str, *args, **kwargs) -> Response:
+        """
+        :return: transfer filtered by transfer_id
+        """
+
+        if transfer_id and not is_valid_unique_transfer_id(transfer_id):
+            return Response(
+                status=status.HTTP_400_BAD_REQUEST,
+                data={
+                    "code": 1,
+                    "message": "transfer_id is not valid",
+                    "arguments": [transfer_id],
+                },
+            )
+        transfer = self.get_queryset(transfer_id)
+        if len(transfer) == 0:
+            return Response(status=status.HTTP_404_NOT_FOUND)
+        serializer = self.get_serializer(add_tokens_to_transfers(transfer)[0])
+        return Response(status=status.HTTP_200_OK, data=serializer.data)
+
+
 class SafeTransferListView(ListAPIView):
     filter_backends = (django_filters.rest_framework.DjangoFilterBackend,)
     filterset_class = filters.TransferListFilter
     serializer_class = serializers.TransferWithTokenInfoResponseSerializer
     pagination_class = pagination.DefaultPagination
-
-    def add_tokens_to_transfers(self, transfers: TransferDict) -> TransferDict:
-        tokens = {
-            token.address: token
-            for token in Token.objects.filter(
-                address__in={
-                    transfer["token_address"]
-                    for transfer in transfers
-                    if transfer["token_address"]
-                }
-            )
-        }
-        for transfer in transfers:
-            transfer["token"] = tokens.get(transfer["token_address"])
-        return transfers
 
     def get_transfers(self, address: str):
         erc20_queryset = self.filter_queryset(
@@ -859,18 +1101,14 @@ class SafeTransferListView(ListAPIView):
 
     def list(self, request, *args, **kwargs):
         # Queryset must be already filtered, as we cannot filter a union
-        # queryset = self.filter_queryset(self.get_queryset())
-
         queryset = self.get_queryset()
         page = self.paginate_queryset(queryset)
         if page is not None:
-            serializer = self.get_serializer(
-                self.add_tokens_to_transfers(page), many=True
-            )
+            serializer = self.get_serializer(add_tokens_to_transfers(page), many=True)
             return self.get_paginated_response(serializer.data)
         else:
             serializer = self.get_serializer(
-                self.add_tokens_to_transfers(queryset), many=True
+                add_tokens_to_transfers(queryset), many=True
             )
             return Response(serializer.data)
 
@@ -1138,6 +1376,13 @@ class SafeMultisigTransactionEstimateView(GenericAPIView):
 
         if not SafeContract.objects.filter(address=address).exists():
             return Response(status=status.HTTP_404_NOT_FOUND)
+
+        # This endpoint is only needed for Safes < 1.3.0, so it should be disabled for L2 chains as they
+        # don't support Safes below that version
+        if settings.ETH_L2_NETWORK:
+            response_serializer = self.response_serializer(data={"safe_tx_gas": 0})
+            response_serializer.is_valid()
+            return Response(status=status.HTTP_200_OK, data=response_serializer.data)
 
         serializer = self.get_serializer(data=request.data)
         if serializer.is_valid():
