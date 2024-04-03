@@ -3,7 +3,8 @@ from unittest import mock
 from django.test import TestCase
 
 from eth_account import Account
-from web3 import Web3
+
+from gnosis.eth.utils import fast_keccak_text
 
 from safe_transaction_service.history.models import (
     EthereumTxCallType,
@@ -24,7 +25,6 @@ from safe_transaction_service.history.tests.factories import (
 )
 
 from ..tasks import (
-    DuplicateNotification,
     filter_notification,
     send_notification_owner_task,
     send_notification_task,
@@ -33,29 +33,6 @@ from .factories import FirebaseDeviceOwnerFactory
 
 
 class TestViews(TestCase):
-    def test_duplicate_notification_manager(self):
-        address = "0x1230B3d59858296A31053C1b8562Ecf89A2f888b"
-        payload = {
-            "address": "0x1230B3d59858296A31053C1b8562Ecf89A2f888b",
-            "type": "INCOMING_TOKEN",
-            "tokenAddress": "0x63704B63Ac04f3a173Dfe677C7e3D330c347CD88",
-            "txHash": "0xd8cf5db08e4f3d43660975c8be02a079139a69c42c0ccdd157618aec9bb91b28",
-            "value": "50000000000000",
-        }
-        duplicate_notification = DuplicateNotification(address, payload)
-        self.assertFalse(duplicate_notification.is_duplicated())
-        self.assertFalse(duplicate_notification.is_duplicated())
-        duplicate_notification.set_duplicated()
-        self.assertTrue(duplicate_notification.is_duplicated())
-        duplicate_notification_2 = DuplicateNotification(
-            address, {"type": "Different_payload"}
-        )
-        self.assertFalse(duplicate_notification_2.is_duplicated())
-        duplicate_notification_3 = DuplicateNotification(
-            Account.create().address, payload
-        )
-        self.assertFalse(duplicate_notification_3.is_duplicated())
-
     def test_filter_notification(self):
         multisig_confirmation = MultisigConfirmationFactory()
         confirmation_notification = build_webhook_payload(
@@ -115,7 +92,7 @@ class TestViews(TestCase):
         safe_address = safe_contract.address
         threshold = 2
         owners = [Account.create().address for _ in range(2)]
-        safe_tx_hash = Web3.keccak(text="hola").hex()
+        safe_tx_hash = fast_keccak_text("hola").hex()
         with self.assertLogs(logger=task_logger) as cm:
             self.assertEqual(
                 send_notification_owner_task.delay(safe_address, safe_tx_hash).result,
@@ -169,8 +146,9 @@ class TestViews(TestCase):
             self.assertIn("Duplicated notification", cm.output[0])
 
         # Disable duplicated detection
-        with mock.patch.object(
-            DuplicateNotification, "is_duplicated", autospec=True, return_value=False
+        with mock.patch(
+            "safe_transaction_service.notifications.tasks.mark_notification_as_processed",
+            return_value=True,
         ):
             self.assertEqual(
                 send_notification_owner_task.delay(safe_address, safe_tx_hash).result,
@@ -206,7 +184,7 @@ class TestViews(TestCase):
                 self.assertIn("does not require more confirmations", cm.output[0])
 
     def test_send_notification_owner_delegate_task(self):
-        safe_tx_hash = Web3.keccak(text="aloha").hex()
+        safe_tx_hash = fast_keccak_text("aloha").hex()
         safe_contract = SafeContractFactory()
         safe_address = safe_contract.address
         safe_status = SafeLastStatusFactory(address=safe_address, threshold=3)
@@ -241,7 +219,7 @@ class TestViews(TestCase):
 
     def test_send_notification_owner_task_called(self):
         safe_address = Account.create().address
-        safe_tx_hash = Web3.keccak(text="hola").hex()
+        safe_tx_hash = fast_keccak_text("hola").hex()
         payload = {
             "address": safe_address,
             "type": WebHookType.PENDING_MULTISIG_TRANSACTION.name,

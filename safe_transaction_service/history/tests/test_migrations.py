@@ -5,7 +5,8 @@ from django.utils import timezone
 
 from django_test_migrations.migrator import Migrator
 from eth_account import Account
-from web3 import Web3
+
+from gnosis.eth.utils import fast_keccak, fast_keccak_text
 
 
 class TestMigrations(TestCase):
@@ -25,13 +26,13 @@ class TestMigrations(TestCase):
             gas_limit=2,
             gas_used=2,
             timestamp=timezone.now(),
-            block_hash=Web3.keccak(b"34"),
-            parent_hash=Web3.keccak(b"12"),
+            block_hash=fast_keccak(b"34"),
+            parent_hash=fast_keccak(b"12"),
         )
 
         return ethereum_tx_class.objects.create(
             block=ethereum_block,
-            tx_hash=Web3.keccak(b"tx-hash"),
+            tx_hash=fast_keccak(b"tx-hash"),
             gas=23000,
             gas_price=1,
             nonce=0,
@@ -53,7 +54,7 @@ class TestMigrations(TestCase):
         ]
         for origin in origins:
             MultisigTransactionOld.objects.create(
-                safe_tx_hash=Web3.keccak(text=f"multisig-tx-{origin}").hex(),
+                safe_tx_hash=fast_keccak_text(f"multisig-tx-{origin}").hex(),
                 safe=Account.create().address,
                 value=0,
                 operation=0,
@@ -72,21 +73,21 @@ class TestMigrations(TestCase):
         )
 
         # String should keep string
-        hash = Web3.keccak(text=f"multisig-tx-{origins[0]}").hex()
+        hash = fast_keccak_text(f"multisig-tx-{origins[0]}").hex()
         self.assertEqual(MultisigTransactionNew.objects.get(pk=hash).origin, origins[0])
 
         # String json should be converted to json
-        hash = Web3.keccak(text=f"multisig-tx-{origins[1]}").hex()
+        hash = fast_keccak_text(f"multisig-tx-{origins[1]}").hex()
         self.assertEqual(
             MultisigTransactionNew.objects.get(pk=hash).origin, json.loads(origins[1])
         )
 
         # Empty string should be empty object
-        hash = Web3.keccak(text=f"multisig-tx-{origins[2]}").hex()
+        hash = fast_keccak_text(f"multisig-tx-{origins[2]}").hex()
         self.assertEqual(MultisigTransactionNew.objects.get(pk=hash).origin, {})
 
         # None should be empty object
-        hash = Web3.keccak(text=f"multisig-tx-{origins[2]}").hex()
+        hash = fast_keccak_text(f"multisig-tx-{origins[2]}").hex()
         self.assertEqual(MultisigTransactionNew.objects.get(pk=hash).origin, {})
 
     def test_migration_backward_0068(self):
@@ -99,7 +100,7 @@ class TestMigrations(TestCase):
         origins = ["{ TestString", {"url": "https://example.com", "name": "app"}, {}]
         for origin in origins:
             MultisigTransactionNew.objects.create(
-                safe_tx_hash=Web3.keccak(text=f"multisig-tx-{origin}").hex(),
+                safe_tx_hash=fast_keccak_text(f"multisig-tx-{origin}").hex(),
                 safe=Account.create().address,
                 value=0,
                 operation=0,
@@ -118,17 +119,17 @@ class TestMigrations(TestCase):
         )
 
         # String should keep string
-        hash = Web3.keccak(text=f"multisig-tx-{origins[0]}").hex()
+        hash = fast_keccak_text(f"multisig-tx-{origins[0]}").hex()
         self.assertEqual(MultisigTransactionOld.objects.get(pk=hash).origin, origins[0])
 
         # Json should be converted to a string json
-        hash = Web3.keccak(text=f"multisig-tx-{origins[1]}").hex()
+        hash = fast_keccak_text(f"multisig-tx-{origins[1]}").hex()
         self.assertEqual(
             MultisigTransactionOld.objects.get(pk=hash).origin, json.dumps(origins[1])
         )
 
         # Empty object should be None
-        hash = Web3.keccak(text=f"multisig-tx-{origins[2]}").hex()
+        hash = fast_keccak_text(f"multisig-tx-{origins[2]}").hex()
         self.assertEqual(MultisigTransactionOld.objects.get(pk=hash).origin, None)
 
     def test_migration_forward_0069(self):
@@ -241,3 +242,99 @@ class TestMigrations(TestCase):
         )
         SafeContract = old_state.apps.get_model("history", "SafeContract")
         self.assertEqual(SafeContract.objects.filter(erc20_block_number=0).count(), 3)
+
+    def test_migration_forward_0073_safe_apps_links(self):
+        """
+        Migrate safe apps links from 'apps.gnosis-safe.io' -> 'apps-portal.safe.global'
+        """
+
+        new_state = self.migrator.apply_initial_migration(
+            ("history", "0072_safecontract_banned_and_more"),
+        )
+        origins = [
+            {"not_url": "random"},
+            {"url": "https://app.zerion.io", "name": "Zerion"},
+            {
+                "url": "https://apps.gnosis-safe.io/tx-builder/",
+                "name": "Transaction Builder",
+            },
+        ]
+
+        MultisigTransaction = new_state.apps.get_model("history", "MultisigTransaction")
+        for origin in origins:
+            MultisigTransaction.objects.create(
+                safe_tx_hash=fast_keccak_text(f"multisig-tx-{origin}").hex(),
+                safe=Account.create().address,
+                value=0,
+                operation=0,
+                safe_tx_gas=0,
+                base_gas=0,
+                gas_price=0,
+                nonce=0,
+                origin=origin,
+            )
+
+        new_state = self.migrator.apply_tested_migration(
+            ("history", "0073_safe_apps_links"),
+        )
+        MultisigTransaction = new_state.apps.get_model("history", "MultisigTransaction")
+        self.assertCountEqual(
+            MultisigTransaction.objects.values_list("origin", flat=True),
+            [
+                {"not_url": "random"},
+                {"url": "https://app.zerion.io", "name": "Zerion"},
+                {
+                    "url": "https://apps-portal.safe.global/tx-builder/",
+                    "name": "Transaction Builder",
+                },
+            ],
+        )
+
+    def test_migration_backward_0073_safe_apps_links(self):
+        """
+        Migrate safe apps links from 'apps.gnosis-safe.io' -> 'apps-portal.safe.global'
+        """
+
+        new_state = self.migrator.apply_initial_migration(
+            ("history", "0073_safe_apps_links"),
+        )
+
+        origins = [
+            {"not_url": "random"},
+            {"url": "https://app.zerion.io", "name": "Zerion"},
+            {
+                "url": "https://apps.gnosis-safe.io/tx-builder/",
+                "name": "Transaction Builder",
+            },
+        ]
+
+        MultisigTransaction = new_state.apps.get_model("history", "MultisigTransaction")
+        for origin in origins:
+            MultisigTransaction.objects.create(
+                safe_tx_hash=fast_keccak_text(f"multisig-tx-{origin}").hex(),
+                safe=Account.create().address,
+                value=0,
+                operation=0,
+                safe_tx_gas=0,
+                base_gas=0,
+                gas_price=0,
+                nonce=0,
+                origin=origin,
+            )
+
+        new_state = self.migrator.apply_tested_migration(
+            ("history", "0072_safecontract_banned_and_more"),
+        )
+
+        MultisigTransaction = new_state.apps.get_model("history", "MultisigTransaction")
+        self.assertCountEqual(
+            MultisigTransaction.objects.values_list("origin", flat=True),
+            [
+                {"not_url": "random"},
+                {"url": "https://app.zerion.io", "name": "Zerion"},
+                {
+                    "url": "https://apps.gnosis-safe.io/tx-builder/",
+                    "name": "Transaction Builder",
+                },
+            ],
+        )

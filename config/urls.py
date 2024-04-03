@@ -13,8 +13,7 @@ schema_view = get_schema_view(
     openapi.Info(
         title="Cronos Safe Transaction Service API",
         default_version="v1",
-        description="API to keep track of transactions sent via Cronos Safe smart contracts",
-        contact=openapi.Contact(email="safe@gnosis.io"),
+        description="API to keep track of transactions sent via Safe smart contracts",
         license=openapi.License(name="MIT License"),
     ),
     validators=["flex", "ssv"],
