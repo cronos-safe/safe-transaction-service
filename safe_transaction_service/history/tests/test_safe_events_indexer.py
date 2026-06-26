@@ -3,14 +3,15 @@ from django.test import TestCase
 from eth_account import Account
 from eth_typing import ChecksumAddress
 from hexbytes import HexBytes
+from safe_eth.eth.constants import NULL_ADDRESS, SENTINEL_ADDRESS
+from safe_eth.eth.contracts import get_safe_V1_3_0_contract, get_safe_V1_4_1_contract
+from safe_eth.safe import Safe
+from safe_eth.safe.tests.safe_test_case import SafeTestCaseMixin
+from safe_eth.util.util import to_0x_hex_str
 from web3 import Web3
+from web3.auto import w3
 from web3.datastructures import AttributeDict
 from web3.types import LogReceipt
-
-from gnosis.eth.constants import NULL_ADDRESS, SENTINEL_ADDRESS
-from gnosis.eth.contracts import get_safe_V1_3_0_contract, get_safe_V1_4_1_contract
-from gnosis.safe import Safe
-from gnosis.safe.tests.safe_test_case import SafeTestCaseMixin
 
 from ..indexers import SafeEventsIndexer, SafeEventsIndexerProvider
 from ..indexers.tx_processor import SafeTxProcessor
@@ -25,8 +26,12 @@ from ..models import (
     SafeLastStatus,
     SafeStatus,
 )
-from .factories import EthereumTxFactory, SafeMasterCopyFactory
-from .mocks.mocks_safe_events_indexer import safe_events_mock
+from .factories import EthereumBlockFactory, EthereumTxFactory, SafeMasterCopyFactory
+from .mocks.mocks_safe_events_indexer import (
+    proxy_creation_event_mock,
+    safe_events_mock,
+    setup_events_mock,
+)
 
 
 class TestSafeEventsIndexerV1_4_1(SafeTestCaseMixin, TestCase):
@@ -34,7 +39,7 @@ class TestSafeEventsIndexerV1_4_1(SafeTestCaseMixin, TestCase):
         self.safe_events_indexer = SafeEventsIndexer(
             self.ethereum_client, confirmations=0, blocks_to_reindex_again=0
         )
-        self.safe_tx_processor = SafeTxProcessor(self.ethereum_client, None)
+        self.safe_tx_processor = SafeTxProcessor(self.ethereum_client, None, None)
 
     def tearDown(self) -> None:
         SafeEventsIndexerProvider.del_singleton()
@@ -135,7 +140,8 @@ class TestSafeEventsIndexerV1_4_1(SafeTestCaseMixin, TestCase):
 
         # Dangling event topic is "supported"
         self.assertIn(
-            dangling_event["topics"][0].hex(), self.safe_events_indexer.events_to_listen
+            to_0x_hex_str(dangling_event["topics"][0]),
+            self.safe_events_indexer.events_to_listen,
         )
 
         # Dangling event cannot be decoded
@@ -143,7 +149,8 @@ class TestSafeEventsIndexerV1_4_1(SafeTestCaseMixin, TestCase):
 
         # Valid event is supported
         self.assertIn(
-            valid_event["topics"][0].hex(), self.safe_events_indexer.events_to_listen
+            to_0x_hex_str(valid_event["topics"][0]),
+            self.safe_events_indexer.events_to_listen,
         )
 
         # Dangling event cannot be decoded, but valid event is
@@ -217,7 +224,7 @@ class TestSafeEventsIndexerV1_4_1(SafeTestCaseMixin, TestCase):
         self.assertEqual(InternalTx.objects.count(), 0)
         self.assertEqual(InternalTxDecoded.objects.count(), 0)
         self.assertEqual(self.safe_events_indexer.start(), (2, 1))
-        self.assertEqual(InternalTxDecoded.objects.count(), 1)
+        self.assertEqual(InternalTxDecoded.objects.count(), 1)  # Just setup is decoded
         self.assertEqual(InternalTx.objects.count(), 2)  # Proxy factory and setup
         create_internal_tx = InternalTx.objects.filter(
             contract_address=safe_address
@@ -233,7 +240,9 @@ class TestSafeEventsIndexerV1_4_1(SafeTestCaseMixin, TestCase):
 
         txs_decoded_queryset = InternalTxDecoded.objects.pending_for_safes()
         self.assertEqual(SafeStatus.objects.count(), 0)
-        self.safe_tx_processor.process_decoded_transactions(txs_decoded_queryset.all())
+        self.safe_tx_processor.process_decoded_transactions(
+            list(txs_decoded_queryset.all())
+        )
         self.assertEqual(SafeStatus.objects.count(), 1)
         safe_status = SafeStatus.objects.get()
         safe_last_status = SafeLastStatus.objects.get(address=safe_address)
@@ -261,7 +270,9 @@ class TestSafeEventsIndexerV1_4_1(SafeTestCaseMixin, TestCase):
         # Process events: SafeMultiSigTransaction, AddedOwner, ExecutionSuccess
         self.assertEqual(self.safe_events_indexer.start(), (3, 1))
         self.assertEqual(InternalTx.objects.count(), 5)
-        self.safe_tx_processor.process_decoded_transactions(txs_decoded_queryset.all())
+        self.safe_tx_processor.process_decoded_transactions(
+            list(txs_decoded_queryset.all())
+        )
         # Add one SafeStatus increasing the nonce and another one adding the owner
         self.assertEqual(SafeStatus.objects.count(), 3)
         safe_status = SafeStatus.objects.last_for_address(
@@ -283,7 +294,7 @@ class TestSafeEventsIndexerV1_4_1(SafeTestCaseMixin, TestCase):
         self.assertEqual(MultisigTransaction.objects.count(), 1)
         self.assertEqual(
             MultisigTransaction.objects.get().safe_tx_hash,
-            multisig_tx.safe_tx_hash.hex(),
+            to_0x_hex_str(multisig_tx.safe_tx_hash),
         )
         self.assertEqual(MultisigConfirmation.objects.count(), 1)
 
@@ -299,7 +310,9 @@ class TestSafeEventsIndexerV1_4_1(SafeTestCaseMixin, TestCase):
         multisig_tx.execute(self.ethereum_test_account.key)
         # Process events: SafeMultiSigTransaction, ChangedThreshold, ExecutionSuccess
         self.assertEqual(self.safe_events_indexer.start(), (3, 1))
-        self.safe_tx_processor.process_decoded_transactions(txs_decoded_queryset.all())
+        self.safe_tx_processor.process_decoded_transactions(
+            list(txs_decoded_queryset.all())
+        )
         # Add one SafeStatus increasing the nonce and another one changing the threshold
         self.assertEqual(SafeStatus.objects.count(), 5)
         safe_status = SafeStatus.objects.last_for_address(
@@ -319,7 +332,7 @@ class TestSafeEventsIndexerV1_4_1(SafeTestCaseMixin, TestCase):
         self.assertEqual(MultisigTransaction.objects.count(), 2)
         self.assertEqual(
             MultisigTransaction.objects.order_by("-nonce")[0].safe_tx_hash,
-            multisig_tx.safe_tx_hash.hex(),
+            to_0x_hex_str(multisig_tx.safe_tx_hash),
         )
         self.assertEqual(MultisigConfirmation.objects.count(), 2)
 
@@ -336,7 +349,9 @@ class TestSafeEventsIndexerV1_4_1(SafeTestCaseMixin, TestCase):
         multisig_tx.execute(self.ethereum_test_account.key)
         # Process events: SafeMultiSigTransaction, RemovedOwner, ChangedThreshold, ExecutionSuccess
         self.assertEqual(self.safe_events_indexer.start(), (4, 1))
-        self.safe_tx_processor.process_decoded_transactions(txs_decoded_queryset.all())
+        self.safe_tx_processor.process_decoded_transactions(
+            list(txs_decoded_queryset.all())
+        )
         # Add one SafeStatus increasing the nonce and another one removing the owner
         self.assertEqual(SafeStatus.objects.count(), 8)
         safe_status = SafeStatus.objects.last_for_address(
@@ -367,7 +382,7 @@ class TestSafeEventsIndexerV1_4_1(SafeTestCaseMixin, TestCase):
         self.assertEqual(MultisigTransaction.objects.count(), 3)
         self.assertEqual(
             MultisigTransaction.objects.order_by("-nonce")[0].safe_tx_hash,
-            multisig_tx.safe_tx_hash.hex(),
+            to_0x_hex_str(multisig_tx.safe_tx_hash),
         )
         self.assertEqual(MultisigConfirmation.objects.count(), 4)
 
@@ -384,7 +399,9 @@ class TestSafeEventsIndexerV1_4_1(SafeTestCaseMixin, TestCase):
         multisig_tx.execute(self.ethereum_test_account.key)
         # Process events: SafeMultiSigTransaction, EnabledModule, ExecutionSuccess
         self.assertEqual(self.safe_events_indexer.start(), (3, 1))
-        self.safe_tx_processor.process_decoded_transactions(txs_decoded_queryset.all())
+        self.safe_tx_processor.process_decoded_transactions(
+            list(txs_decoded_queryset.all())
+        )
         # Add one SafeStatus increasing the nonce and another one enabling the module
         self.assertEqual(SafeStatus.objects.count(), 10)
         safe_status = SafeStatus.objects.last_for_address(
@@ -404,7 +421,7 @@ class TestSafeEventsIndexerV1_4_1(SafeTestCaseMixin, TestCase):
         self.assertEqual(MultisigTransaction.objects.count(), 4)
         self.assertEqual(
             MultisigTransaction.objects.order_by("-nonce")[0].safe_tx_hash,
-            multisig_tx.safe_tx_hash.hex(),
+            to_0x_hex_str(multisig_tx.safe_tx_hash),
         )
         self.assertEqual(MultisigConfirmation.objects.count(), 5)
 
@@ -415,7 +432,9 @@ class TestSafeEventsIndexerV1_4_1(SafeTestCaseMixin, TestCase):
         )
         # Process events: SafeReceived
         self.assertEqual(self.safe_events_indexer.start(), (1, 1))
-        self.safe_tx_processor.process_decoded_transactions(txs_decoded_queryset.all())
+        self.safe_tx_processor.process_decoded_transactions(
+            list(txs_decoded_queryset.all())
+        )
         # Check there's an ether transaction
         internal_tx_queryset = InternalTx.objects.filter(
             value=value,
@@ -438,7 +457,9 @@ class TestSafeEventsIndexerV1_4_1(SafeTestCaseMixin, TestCase):
         multisig_tx.execute(self.ethereum_test_account.key)
         # Process events: SafeMultiSigTransaction, ChangedFallbackHandler, ExecutionSuccess
         self.assertEqual(self.safe_events_indexer.start(), (3, 1))
-        self.safe_tx_processor.process_decoded_transactions(txs_decoded_queryset.all())
+        self.safe_tx_processor.process_decoded_transactions(
+            list(txs_decoded_queryset.all())
+        )
         # Add one SafeStatus increasing the nonce and another one changing the fallback handler
         self.assertEqual(SafeStatus.objects.count(), 12)
         safe_status = SafeStatus.objects.last_for_address(
@@ -460,7 +481,7 @@ class TestSafeEventsIndexerV1_4_1(SafeTestCaseMixin, TestCase):
         self.assertEqual(MultisigTransaction.objects.count(), 5)
         self.assertEqual(
             MultisigTransaction.objects.order_by("-nonce")[0].safe_tx_hash,
-            multisig_tx.safe_tx_hash.hex(),
+            to_0x_hex_str(multisig_tx.safe_tx_hash),
         )
         self.assertEqual(MultisigConfirmation.objects.count(), 6)
 
@@ -476,7 +497,9 @@ class TestSafeEventsIndexerV1_4_1(SafeTestCaseMixin, TestCase):
         multisig_tx.execute(self.ethereum_test_account.key)
         # Process events: SafeMultiSigTransaction, DisabledModule, ExecutionSuccess
         self.assertEqual(self.safe_events_indexer.start(), (3, 1))
-        self.safe_tx_processor.process_decoded_transactions(txs_decoded_queryset.all())
+        self.safe_tx_processor.process_decoded_transactions(
+            list(txs_decoded_queryset.all())
+        )
         # Add one SafeStatus increasing the nonce and another one disabling the module
         self.assertEqual(SafeStatus.objects.count(), 14)
         safe_status = SafeStatus.objects.last_for_address(
@@ -496,7 +519,7 @@ class TestSafeEventsIndexerV1_4_1(SafeTestCaseMixin, TestCase):
         self.assertEqual(MultisigTransaction.objects.count(), 6)
         self.assertEqual(
             MultisigTransaction.objects.order_by("-nonce")[0].safe_tx_hash,
-            multisig_tx.safe_tx_hash.hex(),
+            to_0x_hex_str(multisig_tx.safe_tx_hash),
         )
         self.assertEqual(MultisigConfirmation.objects.count(), 7)
 
@@ -511,16 +534,18 @@ class TestSafeEventsIndexerV1_4_1(SafeTestCaseMixin, TestCase):
             }
         )
         tx = owner_account_1.sign_transaction(tx)
-        self.w3.eth.send_raw_transaction(tx["rawTransaction"])
+        self.w3.eth.send_raw_transaction(tx["raw_transaction"])
         # Process events: ApproveHash
         self.assertEqual(self.safe_events_indexer.start(), (1, 1))
-        self.safe_tx_processor.process_decoded_transactions(txs_decoded_queryset.all())
+        self.safe_tx_processor.process_decoded_transactions(
+            list(txs_decoded_queryset.all())
+        )
         # No SafeStatus was added
         self.assertEqual(SafeStatus.objects.count(), 14)
         # Check a MultisigConfirmation was created
         self.assertTrue(
             MultisigConfirmation.objects.filter(
-                multisig_transaction_hash=random_hash.hex()
+                multisig_transaction_hash=to_0x_hex_str(random_hash)
             ).exists()
         )
         self.assertEqual(
@@ -538,8 +563,10 @@ class TestSafeEventsIndexerV1_4_1(SafeTestCaseMixin, TestCase):
         multisig_tx.sign(owner_account_1.key)
         multisig_tx.execute(self.ethereum_test_account.key)
         # Process events: SafeMultiSigTransaction, ExecutionSuccess
-        self.assertEqual(self.safe_events_indexer.start(), (2, 1))
-        self.safe_tx_processor.process_decoded_transactions(txs_decoded_queryset.all())
+        self.assertEqual(self.safe_events_indexer.start(), (3, 1))
+        self.safe_tx_processor.process_decoded_transactions(
+            list(txs_decoded_queryset.all())
+        )
         # Add one SafeStatus increasing the nonce
         self.assertEqual(SafeStatus.objects.count(), 15)
         safe_status = SafeStatus.objects.last_for_address(
@@ -555,7 +582,7 @@ class TestSafeEventsIndexerV1_4_1(SafeTestCaseMixin, TestCase):
         self.assertEqual(MultisigTransaction.objects.count(), 7)
         self.assertEqual(
             MultisigTransaction.objects.order_by("-nonce")[0].safe_tx_hash,
-            multisig_tx.safe_tx_hash.hex(),
+            to_0x_hex_str(multisig_tx.safe_tx_hash),
         )
         self.assertEqual(MultisigConfirmation.objects.count(), 9)
 
@@ -573,7 +600,9 @@ class TestSafeEventsIndexerV1_4_1(SafeTestCaseMixin, TestCase):
         # Process events: SafeMultiSigTransaction, ChangedGuard, ExecutionSuccess
         # 2 blocks will be processed due to the guard deployment
         self.assertEqual(self.safe_events_indexer.start(), (3, 2))
-        self.safe_tx_processor.process_decoded_transactions(txs_decoded_queryset.all())
+        self.safe_tx_processor.process_decoded_transactions(
+            list(txs_decoded_queryset.all())
+        )
         # Add one SafeStatus increasing the nonce and another one changing the guard
         self.assertEqual(SafeStatus.objects.count(), 17)
         safe_status = SafeStatus.objects.last_for_address(
@@ -598,7 +627,7 @@ class TestSafeEventsIndexerV1_4_1(SafeTestCaseMixin, TestCase):
 
         self.assertEqual(
             MultisigTransaction.objects.order_by("-nonce")[0].safe_tx_hash,
-            multisig_tx.safe_tx_hash.hex(),
+            to_0x_hex_str(multisig_tx.safe_tx_hash),
         )
         expected_multisig_transactions = 8
         expected_multisig_confirmations = 10
@@ -618,7 +647,6 @@ class TestSafeEventsIndexerV1_4_1(SafeTestCaseMixin, TestCase):
         )
 
         # Event processing should be idempotent, so no changes must be done if everything is processed again
-        self.assertTrue(self.safe_events_indexer._is_setup_indexed(safe_address))
         safe_l2_master_copy.tx_block_number = initial_block_number
         safe_l2_master_copy.save(update_fields=["tx_block_number"])
         blocks_processed = (
@@ -634,7 +662,7 @@ class TestSafeEventsIndexerV1_4_1(SafeTestCaseMixin, TestCase):
         self.assertEqual(
             len(
                 self.safe_tx_processor.process_decoded_transactions(
-                    txs_decoded_queryset.all()
+                    list(txs_decoded_queryset.all())
                 )
             ),
             expected_internal_txs_decoded,
@@ -651,6 +679,61 @@ class TestSafeEventsIndexerV1_4_1(SafeTestCaseMixin, TestCase):
             InternalTxDecoded.objects.count(), expected_internal_txs_decoded
         )
 
+    def test_safe_events_indexer_zksync(self):
+        owner_account_1 = self.ethereum_test_account
+        owners = [owner_account_1.address]
+        threshold = 1
+        to = NULL_ADDRESS
+        data = b""
+        fallback_handler = NULL_ADDRESS
+        payment_token = NULL_ADDRESS
+        payment = 0
+        payment_receiver = NULL_ADDRESS
+        initializer = HexBytes(
+            self.safe_contract.functions.setup(
+                owners,
+                threshold,
+                to,
+                data,
+                fallback_handler,
+                payment_token,
+                payment,
+                payment_receiver,
+            ).build_transaction({"gas": 1, "gasPrice": 1})["data"]
+        )
+        initial_block_number = self.ethereum_client.current_block_number + 1
+        SafeMasterCopyFactory(
+            address=self.safe_contract.address,
+            initial_block_number=initial_block_number,
+            tx_block_number=initial_block_number,
+            version=self.safe_contract_version,
+            l2=True,
+        )
+        ethereum_tx_sent = self.proxy_factory.deploy_proxy_contract_with_nonce(
+            self.ethereum_test_account,
+            self.safe_contract.address,
+            initializer=initializer,
+        )
+        safe_address = ethereum_tx_sent.contract_address
+        safe_contract = self.get_safe_contract(self.w3, safe_address)
+        self.assertEqual(
+            safe_contract.functions.VERSION().call(), self.safe_contract_version
+        )
+        self.assertEqual(self.safe_events_indexer.start(), (2, 1))
+
+        # Check SafeReceived (ether received) on Safe -----------------------------------------------------------------
+        value = 1256
+        self.ethereum_client.get_transaction_receipt(
+            self.send_ether(safe_address, value)
+        )
+        # Process events: SafeReceived
+        with self.settings(ETH_ZKSYNC_COMPATIBLE_NETWORK=True):
+            self.safe_events_indexer = SafeEventsIndexer(
+                self.ethereum_client, confirmations=0, blocks_to_reindex_again=0
+            )
+        # No events are processed
+        self.assertEqual(self.safe_events_indexer.start(), (0, 1))
+
     def test_element_already_processed_checker(self):
         # SafeEventsIndexer does not use bulk saving into database,
         # so mark_as_processed is just a optimization but not critical
@@ -663,14 +746,14 @@ class TestSafeEventsIndexerV1_4_1(SafeTestCaseMixin, TestCase):
                 EthereumTxFactory(tx_hash=tx_hash, block__block_hash=block_hash)
 
         # After the first processing transactions will be cached to prevent reprocessing
-        processed_element_cache = (
-            self.safe_events_indexer.element_already_processed_checker._processed_element_cache
-        )
+        processed_element_cache = self.safe_events_indexer.element_already_processed_checker._processed_element_cache
         self.assertEqual(len(processed_element_cache), 0)
         self.assertEqual(
-            len(self.safe_events_indexer.process_elements(safe_events_mock)), 28
+            len(self.safe_events_indexer.process_elements(safe_events_mock)), 29
         )
-        self.assertEqual(len(processed_element_cache), 28)
+        self.assertEqual(
+            len(processed_element_cache), 28
+        )  # Child internal txs (Ether transfers) don't count
 
         # Transactions are cached and will not be reprocessed
         self.assertEqual(
@@ -706,6 +789,222 @@ class TestSafeEventsIndexerV1_4_1(SafeTestCaseMixin, TestCase):
         with self.safe_events_indexer.auto_adjust_block_limit(100, 104):
             pass
         self.assertEqual(self.safe_events_indexer.block_process_limit, 5)
+
+    def test_get_safe_creation_events(self):
+        decoded_elements = self.safe_events_indexer.decode_elements(safe_events_mock)
+        self.assertEqual(len(decoded_elements), 28)
+        safe_creation_events = self.safe_events_indexer._get_safe_creation_events(
+            decoded_elements
+        )
+        self.assertEqual(len(safe_creation_events), 1)
+        safe_address = "0x0059c65c3d2325D77E9288E022D24d3972b1799D"  # Safe address created in safe_events_mock
+        self.assertEqual(len(safe_creation_events[safe_address]), 2)
+        self.assertEqual(safe_creation_events[safe_address][0]["event"], "SafeSetup")
+        self.assertEqual(
+            safe_creation_events[safe_address][1]["event"], "ProxyCreation"
+        )
+
+        # Add a ProxyCreation and SafeSetup event for different safe address
+        modified_safe_events_mock = safe_events_mock.copy()  # Avoid race conditions
+        modified_safe_events_mock.append(proxy_creation_event_mock[0])
+        modified_safe_events_mock.append(setup_events_mock[0])
+        decoded_elements = self.safe_events_indexer.decode_elements(
+            modified_safe_events_mock
+        )
+        safe_creation_events = self.safe_events_indexer._get_safe_creation_events(
+            decoded_elements
+        )
+        self.assertEqual(len(safe_creation_events), 3)
+        new_setup_event = "0x33310eeBb69B19963dA4a16Aeafac78AB6901fbB"
+        self.assertEqual(len(safe_creation_events[new_setup_event]), 1)
+        self.assertEqual(safe_creation_events[new_setup_event][0]["event"], "SafeSetup")
+        new_proxy_event = "0x999E362288fA8313c56b59e7AB0ead4afA92441e"
+        self.assertEqual(len(safe_creation_events[new_proxy_event]), 1)
+        self.assertEqual(
+            safe_creation_events[new_proxy_event][0]["event"], "ProxyCreation"
+        )
+        # Previous events should remains equal
+        self.assertEqual(len(safe_creation_events[safe_address]), 2)
+        self.assertEqual(safe_creation_events[safe_address][0]["event"], "SafeSetup")
+        self.assertEqual(
+            safe_creation_events[safe_address][1]["event"], "ProxyCreation"
+        )
+
+    def test_proxy_creation_event_without_initializer(self):
+        initial_block_number = self.ethereum_client.current_block_number + 1
+        SafeMasterCopyFactory(
+            address=self.safe_contract.address,
+            initial_block_number=initial_block_number,
+            tx_block_number=initial_block_number,
+            version=self.safe_contract_version,
+            l2=True,
+        )
+        ethereum_tx_sent = self.proxy_factory.deploy_proxy_contract_with_nonce(
+            self.ethereum_test_account,
+            self.safe_contract.address,
+            initializer=b"",
+        )
+        safe_address = ethereum_tx_sent.contract_address
+        self.assertEqual(InternalTx.objects.count(), 0)
+        self.assertEqual(InternalTxDecoded.objects.count(), 0)
+        self.assertEqual(self.safe_events_indexer.start(), (1, 1))
+        self.assertEqual(
+            InternalTxDecoded.objects.count(), 0
+        )  # Just created without setup
+        self.assertEqual(InternalTx.objects.count(), 1)  # Proxy factory
+        # Proxy creation InternalTx must contain the Safe address
+        self.assertEqual(
+            InternalTx.objects.filter(contract_address=safe_address).count(), 1
+        )
+        # Call setup
+        owner_account_1 = self.ethereum_test_account
+        owners = [owner_account_1.address]
+        threshold = 1
+        to = NULL_ADDRESS
+        data = b""
+        fallback_handler = NULL_ADDRESS
+        payment_token = NULL_ADDRESS
+        payment = 0
+        payment_receiver = NULL_ADDRESS
+        deployed_safe_contract = get_safe_V1_4_1_contract(self.w3, safe_address)
+        setup_call = deployed_safe_contract.functions.setup(
+            owners,
+            threshold,
+            to,
+            data,
+            fallback_handler,
+            payment_token,
+            payment,
+            payment_receiver,
+        ).build_transaction(
+            {"nonce": self.w3.eth.get_transaction_count(owner_account_1.address)}
+        )
+        signed_tx = owner_account_1.sign_transaction(setup_call)
+        w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+        self.assertEqual(self.safe_events_indexer.start(), (1, 1))
+        # We remove the proxyCreation internaltx
+        self.assertEqual(InternalTx.objects.count(), 1)
+        self.assertEqual(InternalTxDecoded.objects.count(), 1)
+        # TODO get singleton address when setup and creation are not indexed together
+        # self.assertEqual(InternalTx.objects.filter(contract_address=None, to=self.safe_contract.address).count(), 1)
+        # ProxyCreation first and SafeSetup later indexed together
+        ethereum_tx_sent = self.proxy_factory.deploy_proxy_contract_with_nonce(
+            self.ethereum_test_account,
+            self.safe_contract_V1_3_0.address,
+            initializer=b"",
+        )
+        safe_address = ethereum_tx_sent.contract_address
+        deployed_safe_contract = get_safe_V1_4_1_contract(self.w3, safe_address)
+        setup_call = deployed_safe_contract.functions.setup(
+            owners,
+            threshold,
+            to,
+            data,
+            fallback_handler,
+            payment_token,
+            payment,
+            payment_receiver,
+        ).build_transaction(
+            {"nonce": self.w3.eth.get_transaction_count(owner_account_1.address)}
+        )
+        signed_tx = owner_account_1.sign_transaction(setup_call)
+        w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+        self.assertEqual(self.safe_events_indexer.start(), (2, 2))
+        # Proxy creation InternalTx must contain the Safe address
+        self.assertEqual(
+            InternalTx.objects.filter(contract_address=safe_address).count(), 1
+        )
+        self.assertEqual(
+            InternalTx.objects.filter(
+                contract_address=None, to=self.safe_contract_V1_3_0.address
+            ).count(),
+            1,
+        )
+
+    def test_process_safe_creation_events_forcing_duplicate_events(self):
+        # Insert a lonely ProxyCreation event
+        proxy_creation_events = self.safe_events_indexer.decode_elements(
+            proxy_creation_event_mock[:1]
+        )
+        block = EthereumBlockFactory(block_hash=proxy_creation_events[0]["blockHash"])
+        EthereumTxFactory(
+            tx_hash=proxy_creation_events[0]["transactionHash"], block=block
+        )
+        self.assertEqual(len(proxy_creation_events), 1)
+        safe_creation_events = self.safe_events_indexer._get_safe_creation_events(
+            proxy_creation_events
+        )
+        self.assertEqual(len(safe_creation_events), 1)
+        internal_txs = self.safe_events_indexer._process_safe_creation_events(
+            safe_creation_events,
+        )
+        self.assertEqual(len(internal_txs), 1)
+        self.assertEqual(InternalTx.objects.count(), 1)
+        self.assertEqual(InternalTxDecoded.objects.count(), 0)
+
+        # Insert the same previous proxy creation event shouldn't be possible
+        internal_txs = self.safe_events_indexer._process_safe_creation_events(
+            safe_creation_events,
+        )
+        self.assertEqual(len(internal_txs), 0)
+        self.assertEqual(InternalTx.objects.count(), 1)
+        self.assertEqual(InternalTxDecoded.objects.count(), 0)
+
+        # Add new proxyCreation to the events list
+        proxy_creation_events = self.safe_events_indexer.decode_elements(
+            proxy_creation_event_mock[:2]
+        )
+        proxy_block = EthereumBlockFactory(
+            block_hash=proxy_creation_events[1]["blockHash"]
+        )
+        EthereumTxFactory(
+            tx_hash=proxy_creation_events[1]["transactionHash"], block=proxy_block
+        )
+        self.assertEqual(len(proxy_creation_events), 2)
+        safe_creation_events = self.safe_events_indexer._get_safe_creation_events(
+            proxy_creation_events
+        )
+        self.assertEqual(len(safe_creation_events), 2)
+        internal_txs = self.safe_events_indexer._process_safe_creation_events(
+            safe_creation_events,
+        )
+        self.assertEqual(len(internal_txs), 1)
+        self.assertEqual(InternalTx.objects.count(), 2)
+        self.assertEqual(InternalTxDecoded.objects.count(), 0)
+
+        # Try to insert the same events shouldn't insert anything
+        internal_txs = self.safe_events_indexer._process_safe_creation_events(
+            safe_creation_events,
+        )
+        self.assertEqual(len(internal_txs), 0)
+        self.assertEqual(InternalTx.objects.count(), 2)
+        self.assertEqual(InternalTxDecoded.objects.count(), 0)
+
+        # Add setup event to the last proxyCreation event
+        creation_events_mock = proxy_creation_event_mock
+        creation_events_mock.append(setup_events_mock[1])
+        creation_events = self.safe_events_indexer.decode_elements(creation_events_mock)
+        setup_block = EthereumBlockFactory(block_hash=creation_events[2]["blockHash"])
+        EthereumTxFactory(
+            tx_hash=creation_events[2]["transactionHash"], block=setup_block
+        )
+        safe_creation_events = self.safe_events_indexer._get_safe_creation_events(
+            creation_events
+        )
+        internal_txs = self.safe_events_indexer._process_safe_creation_events(
+            safe_creation_events,
+        )
+        self.assertEqual(len(internal_txs), 1)
+        self.assertEqual(InternalTx.objects.count(), 3)
+        self.assertEqual(InternalTxDecoded.objects.count(), 1)
+
+        # Process the same events shouldn't insert anything
+        internal_txs = self.safe_events_indexer._process_safe_creation_events(
+            safe_creation_events,
+        )
+        self.assertEqual(len(internal_txs), 0)
+        self.assertEqual(InternalTx.objects.count(), 3)
+        self.assertEqual(InternalTxDecoded.objects.count(), 1)
 
 
 class TestSafeEventsIndexerV1_3_0(TestSafeEventsIndexerV1_4_1):

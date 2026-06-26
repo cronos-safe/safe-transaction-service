@@ -4,7 +4,8 @@ from unittest.mock import MagicMock
 
 from django.test import TestCase
 
-from gnosis.eth.ethereum_client import EthereumNetwork
+from ens import ENS
+from safe_eth.eth.ethereum_client import EthereumNetwork
 
 from ...utils.redis import get_redis
 from ..models import TokenList
@@ -51,9 +52,85 @@ class TestTasks(TestCase):
         self.assertEqual(update_token_info_from_token_list_task.delay().result, 0)
 
         # Create a token in the list, it should be updated
-        TokenFactory(address="0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")
+        token = TokenFactory(
+            address="0x4A64515E5E1d1073e83f30cB97BEd20400b66E10",
+            logo=None,
+            logo_uri="http://test-logo-uri.local/",
+            name="Old Name",
+            symbol="OLD",
+        )
+        self.assertFalse(token.trusted)
         self.assertEqual(update_token_info_from_token_list_task.delay().result, 1)
+        token.refresh_from_db()
+        self.assertTrue(token.trusted)
+        self.assertEqual(
+            token.logo_uri,
+            "https://cloudflare-ipfs.com/ipfs/QmYNLKHDEoG9FLJtbJ1r8HCyi7by9gksuacRkhkakxwEQ8",
+        )
+        self.assertEqual(token.get_full_logo_uri(), token.logo_uri)
+        self.assertEqual(token.name, "Wrapped ZEC")
+        self.assertEqual(token.symbol, "WZEC")
 
         # Create another token in the list, both should be updated
-        TokenFactory(address="0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599")
+        token_2 = TokenFactory(
+            address="0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",
+            name="Old BTC",
+            symbol="OBTC",
+        )
+        self.assertFalse(token_2.trusted)
         self.assertEqual(update_token_info_from_token_list_task.delay().result, 2)
+        token_2.refresh_from_db()
+        self.assertTrue(token_2.trusted)
+        self.assertEqual(token_2.name, "Wrapped BTC")
+        self.assertEqual(token_2.symbol, "WBTC")
+
+        # Test ENS
+        get_tokens_mock.return_value.append(
+            {
+                "chainId": 1,
+                "address": "safe.eth",
+                "symbol": "SAFE",
+                "name": "Safe Token",
+                "decimals": 18,
+            }
+        )
+
+        safe_token_address = "0x5aFE3855358E112B5647B952709E6165e1c1eEEe"
+        token_ens = TokenFactory(address=safe_token_address)
+        self.assertFalse(token_ens.trusted)
+
+        # Ens cannot be resolved
+        self.assertEqual(update_token_info_from_token_list_task.delay().result, 2)
+
+        with mock.patch.object(ENS, "address", return_value=safe_token_address):
+            self.assertEqual(update_token_info_from_token_list_task.delay().result, 3)
+            token_ens.refresh_from_db()
+            self.assertTrue(token_ens.trusted)
+            self.assertEqual(token_ens.name, "Safe Token")
+            self.assertEqual(token_ens.symbol, "SAFE")
+
+        # Token with long name and symbol (exceeds 60 chars)
+        long_name = "L" * 100
+        long_symbol = "S" * 100
+        long_token_address = "0x2222222222222222222222222222222222222222"
+
+        get_tokens_mock.return_value.append(
+            {
+                "chainId": 1,
+                "address": long_token_address,
+                "symbol": long_symbol,
+                "name": long_name,
+                "decimals": 18,
+            }
+        )
+
+        long_token = TokenFactory(
+            address=long_token_address, name="placeholder", symbol="PH"
+        )
+        self.assertFalse(long_token.trusted)
+
+        self.assertEqual(update_token_info_from_token_list_task.delay().result, 3)
+        long_token.refresh_from_db()
+        self.assertTrue(long_token.trusted)
+        self.assertEqual(long_token.name, long_name[:60])
+        self.assertEqual(long_token.symbol, long_symbol[:60])

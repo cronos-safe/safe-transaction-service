@@ -1,7 +1,7 @@
 from logging import getLogger
-from typing import Optional
 
 from hexbytes import HexBytes
+from safe_eth.util.util import to_0x_hex_str
 
 from safe_transaction_service.utils.utils import FixedSizeDict
 
@@ -26,7 +26,7 @@ class ElementAlreadyProcessedChecker:
         return tx_hash + block_hash + index
 
     def is_processed(
-        self, tx_hash: HexBytes, block_hash: Optional[HexBytes], index: int = 0
+        self, tx_hash: HexBytes, block_hash: HexBytes | None, index: int = 0
     ) -> bool:
         """
         :param tx_hash:
@@ -38,7 +38,7 @@ class ElementAlreadyProcessedChecker:
         return tx_id in self._processed_element_cache
 
     def mark_as_processed(
-        self, tx_hash: HexBytes, block_hash: Optional[HexBytes], index: int = 0
+        self, tx_hash: HexBytes, block_hash: HexBytes | None, index: int = 0
     ) -> bool:
         """
         Mark element as processed if it is not already marked
@@ -53,16 +53,16 @@ class ElementAlreadyProcessedChecker:
         if tx_id in self._processed_element_cache:
             logger.debug(
                 "Element with tx-hash=%s on block=%s with index=%d was already processed",
-                tx_hash.hex(),
-                block_hash.hex(),
+                to_0x_hex_str(tx_hash),
+                to_0x_hex_str(block_hash),
                 index,
             )
             return False
         else:
             logger.debug(
                 "Marking element with tx-hash=%s on block=%s with index=%d as processed",
-                tx_hash.hex(),
-                block_hash.hex(),
+                to_0x_hex_str(tx_hash),
+                to_0x_hex_str(block_hash),
                 index,
             )
             self._processed_element_cache[tx_id] = None

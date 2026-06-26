@@ -1,11 +1,10 @@
 import logging
 from functools import lru_cache
-from typing import Any, Dict, Optional
+from typing import Any
 from urllib.parse import urljoin
 
 from eth_typing import ChecksumAddress
-
-from gnosis.eth import EthereumNetwork
+from safe_eth.eth import EthereumNetwork
 
 from safe_transaction_service.tokens.clients.base_client import BaseHTTPClient
 from safe_transaction_service.tokens.clients.exceptions import (
@@ -37,7 +36,7 @@ class CoingeckoClient(BaseHTTPClient):
     base_url = "https://api.coingecko.com/"
 
     def __init__(
-        self, network: Optional[EthereumNetwork] = None, request_timeout: int = 10
+        self, network: EthereumNetwork | None = None, request_timeout: int = 10
     ):
         super().__init__(request_timeout=request_timeout)
         self.asset_platform = self.ASSET_BY_NETWORK.get(network, "ethereum")
@@ -46,7 +45,7 @@ class CoingeckoClient(BaseHTTPClient):
     def supports_network(cls, network: EthereumNetwork):
         return network in cls.ASSET_BY_NETWORK
 
-    def _do_request(self, url: str) -> Dict[str, Any]:
+    def _do_request(self, url: str) -> dict[str, Any]:
         try:
             response = self.http_session.get(url, timeout=self.request_timeout)
             if not response.ok:
@@ -56,14 +55,12 @@ class CoingeckoClient(BaseHTTPClient):
                     raise CoingeckoRateLimitError(url)
                 raise CoingeckoRequestError(url)
             return response.json()
-        except (ValueError, IOError) as e:
+        except (OSError, ValueError) as e:
             logger.warning("Problem fetching %s", url)
             raise CoingeckoRequestError from e
 
-    @lru_cache(maxsize=128)
-    def get_token_info(
-        self, token_address: ChecksumAddress
-    ) -> Optional[Dict[str, Any]]:
+    @lru_cache(maxsize=128)  # noqa: B019
+    def get_token_info(self, token_address: ChecksumAddress) -> dict[str, Any] | None:
         token_address = token_address.lower()
         url = urljoin(
             self.base_url,
@@ -74,7 +71,7 @@ class CoingeckoClient(BaseHTTPClient):
         except Coingecko404:
             return None
 
-    def get_token_logo_url(self, token_address: ChecksumAddress) -> Optional[str]:
+    def get_token_logo_url(self, token_address: ChecksumAddress) -> str | None:
         token_info = self.get_token_info(token_address)
         if token_info:
             return token_info["image"]["large"]

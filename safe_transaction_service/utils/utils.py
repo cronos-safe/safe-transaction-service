@@ -1,10 +1,8 @@
+import datetime
 import socket
-from functools import wraps
+from collections.abc import Iterable
 from itertools import islice
-from typing import Any, Iterable, List, Union
-
-from django.core.signals import request_finished
-from django.db import connection
+from typing import Any
 
 import gevent.socket
 
@@ -27,7 +25,7 @@ class FixedSizeDict(dict):
                 self.pop(next(iter(self)))
 
 
-def chunks(elements: List[Any], n: int) -> Iterable[Any]:
+def chunks(elements: list[Any], n: int) -> Iterable[Any]:
     """
     :param elements: List
     :param n: Number of elements per chunk
@@ -57,26 +55,16 @@ def running_on_gevent() -> bool:
     return socket.socket is gevent.socket.socket
 
 
-def close_gevent_db_connection() -> None:
-    """
-    Clean gevent db connections. Check `atomic block` to prevent breaking the tests (Django `TestCase` wraps tests
-    inside an atomic block that rollbacks at the end of the test)
-    https://github.com/jneight/django-db-geventpool#using-orm-when-not-serving-requests
-    """
-    if not connection.in_atomic_block:
-        request_finished.send(sender="greenlet")
-
-
-def close_gevent_db_connection_decorator(f):
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        try:
-            return f(*args, **kwargs)
-        finally:
-            close_gevent_db_connection()
-
-    return wrapper
-
-
-def parse_boolean_query_param(value: Union[bool, str, int]) -> bool:
+def parse_boolean_query_param(value: bool | str | int) -> bool:
     return value in (True, "True", "true", "1", 1)
+
+
+def datetime_to_str(value: datetime.datetime) -> str:
+    """
+    :param value: `datetime.datetime` value
+    :return: ``ISO 8601`` date with ``Z`` format
+    """
+    value = value.isoformat()
+    if value.endswith("+00:00"):
+        value = value[:-6] + "Z"
+    return value

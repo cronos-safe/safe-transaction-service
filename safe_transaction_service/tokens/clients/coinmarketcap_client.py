@@ -1,10 +1,10 @@
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any
 from urllib.parse import urljoin
 
-from gnosis.eth.utils import fast_to_checksum_address
+from safe_eth.eth.utils import fast_to_checksum_address
 
 from .base_client import BaseHTTPClient
 
@@ -47,7 +47,7 @@ class CoinMarketCapClient(BaseHTTPClient):
                         f.write(chunk)
             return local_filename
 
-    def get_map(self) -> List[Dict[str, Any]]:
+    def get_map(self) -> list[dict[str, Any]]:
         """
         [
             {'id': 1659,
@@ -86,11 +86,11 @@ class CoinMarketCapClient(BaseHTTPClient):
                 .json()
                 .get("data", [])
             )
-        except IOError:
+        except OSError:
             logger.warning("Problem getting tokens from coinmarketcap", exc_info=True)
             return []
 
-    def get_ethereum_tokens(self) -> List[CoinMarketCapToken]:
+    def get_ethereum_tokens(self) -> list[CoinMarketCapToken]:
         tokens = []
         for token in self.get_map():
             if (
@@ -109,7 +109,7 @@ class CoinMarketCapClient(BaseHTTPClient):
                             token["name"],
                             token["symbol"],
                             checksummed_address,
-                            urljoin(self.base_logo_uri, f'{token["id"]}.png'),
+                            urljoin(self.base_logo_uri, f"{token['id']}.png"),
                         )
                     )
                 except ValueError:

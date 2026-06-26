@@ -1,6 +1,7 @@
 from django.core.cache import cache as django_cache
 
 import django_filters
+from drf_spectacular.utils import extend_schema
 from rest_framework.filters import OrderingFilter
 from rest_framework.generics import ListAPIView, RetrieveAPIView
 
@@ -9,7 +10,15 @@ from .models import Contract
 from .signals import get_contract_cache_key
 
 
+@extend_schema(
+    deprecated=True,
+    description="Please migrate to the new [safe-decoder-service](https://docs.safe.global/core-api/safe-decoder-service-overview)",
+)
 class ContractView(RetrieveAPIView):
+    """
+    Returns the relevant information of a known smart contract
+    """
+
     lookup_field = "address"
     queryset = Contract.objects.select_related("contract_abi")
     serializer_class = serializers.ContractSerializer
@@ -24,18 +33,25 @@ class ContractView(RetrieveAPIView):
                         cache_key, response, timeout=60 * 60
                     ),  # Cache 1 hour:
                     r,
-                )[
-                    1
-                ]  # Return r, if not redis has issues
+                )[1]  # Return r, if not redis has issues
             )
         return response
 
 
+@extend_schema(
+    deprecated=True,
+    description="Please migrate to the new [safe-decoder-service](https://docs.safe.global/core-api/safe-decoder-service-overview)",
+)
 class ContractsView(ListAPIView):
+    """
+    Returns the list of known smart contracts with their ABI’s
+    """
+
     filter_backends = [
         django_filters.rest_framework.DjangoFilterBackend,
         OrderingFilter,
     ]
+    filterset_fields = ["trusted_for_delegate_call"]
     ordering = ["address"]
     ordering_fields = ["address", "name"]
     pagination_class = pagination.DefaultPagination

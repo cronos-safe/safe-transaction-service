@@ -1,19 +1,27 @@
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+import json
+from collections.abc import Sequence
+from typing import Any
 
+from django.conf import settings
+
+import safe_eth.eth.django.serializers as eth_serializers
 from eth_typing import ChecksumAddress, HexStr
 from hexbytes import HexBytes
 from rest_framework import serializers
 from rest_framework.exceptions import ValidationError
-
-import gnosis.eth.django.serializers as eth_serializers
-from gnosis.eth import EthereumClientProvider
-from gnosis.eth.eip712 import eip712_encode_hash
-from gnosis.safe.safe_signature import SafeSignature, SafeSignatureType
+from safe_eth.eth import get_auto_ethereum_client
+from safe_eth.eth.eip712 import eip712_encode
+from safe_eth.eth.utils import fast_keccak
+from safe_eth.safe.safe_signature import SafeSignature, SafeSignatureType
+from safe_eth.util.util import to_0x_hex_str
 
 from safe_transaction_service.utils.serializers import get_safe_owners
 
 from .models import SIGNATURE_LENGTH, SafeMessage, SafeMessageConfirmation
-from .utils import get_hash_for_message, get_safe_message_hash_for_message
+from .utils import (
+    get_message_encoded,
+    get_safe_message_hash_and_preimage_for_message,
+)
 
 
 # Request serializers
@@ -22,12 +30,11 @@ class SafeMessageSignatureParserMixin:
         self,
         safe_signatures: Sequence[SafeSignature],
         safe_address: ChecksumAddress,
-        safe_message: Optional[SafeMessage],
-    ) -> Tuple[ChecksumAddress, SafeSignatureType]:
+        safe_message: SafeMessage | None,
+    ) -> tuple[ChecksumAddress, SafeSignatureType]:
         """
         :param safe_signatures:
         :param safe_address:
-        :param message_hash: Original hash of the message (not the one tied to the Safe)
         :param safe_message: Safe message database object (if already created)
         :return:
         :raises ValidationError:
@@ -37,11 +44,11 @@ class SafeMessageSignatureParserMixin:
                 f"1 owner signature was expected, {len(safe_signatures)} received"
             )
 
-        ethereum_client = EthereumClientProvider()
+        ethereum_client = get_auto_ethereum_client()
         for safe_signature in safe_signatures:
             if not safe_signature.is_valid(ethereum_client, safe_address):
                 raise ValidationError(
-                    f"Signature={safe_signature.signature.hex()} for owner={safe_signature.owner} is not valid"
+                    f"Signature={to_0x_hex_str(safe_signature.signature)} for owner={safe_signature.owner} is not valid"
                 )
 
         owner = safe_signatures[0].owner
@@ -54,6 +61,11 @@ class SafeMessageSignatureParserMixin:
                 raise ValidationError(f"Signature for owner {owner} already exists")
 
         owners = get_safe_owners(safe_address)
+        if owner in settings.BANNED_EOAS:
+            raise ValidationError(
+                f"Signer={owner} is not authorized to interact with the service"
+            )
+
         if owner not in owners:
             raise ValidationError(f"{owner} is not an owner of the Safe")
 
@@ -66,14 +78,27 @@ class SafeMessageSerializer(SafeMessageSignatureParserMixin, serializers.Seriali
     signature = eth_serializers.HexadecimalField(
         min_length=65, max_length=SIGNATURE_LENGTH
     )
+    origin = serializers.CharField(max_length=200, allow_null=True, default=None)
 
-    def validate_message(self, value: Union[str, Dict[str, Any]]):
+    def validate_origin(self, origin):
+        # Origin field on db is a JsonField
+        if origin:
+            try:
+                origin = json.loads(origin)
+            except ValueError:
+                pass
+        else:
+            origin = {}
+
+        return origin
+
+    def validate_message(self, value: str | dict[str, Any]):
         if isinstance(value, str):
             return value
 
         if isinstance(value, dict):
             try:
-                eip712_encode_hash(value)
+                eip712_encode(value)
                 return value
             except ValueError as exc:
                 raise ValidationError(
@@ -85,22 +110,27 @@ class SafeMessageSerializer(SafeMessageSignatureParserMixin, serializers.Seriali
     def validate(self, attrs):
         attrs = super().validate(attrs)
         safe_address = self.context["safe_address"]
+        attrs["safe"] = safe_address
         message = attrs["message"]
         signature = attrs["signature"]
-        attrs["safe"] = safe_address
-        message_hash = get_hash_for_message(message)
-        safe_message_hash = get_safe_message_hash_for_message(
-            safe_address, message_hash
+        # Encode EIP-191 or EIP-712 original message as bytes
+        # Use fast_keccak to maintain compatibility with the old version
+        message_hash = fast_keccak(get_message_encoded(message))
+        safe_message_hash, safe_message_preimage = (
+            get_safe_message_hash_and_preimage_for_message(safe_address, message_hash)
         )
         attrs["message_hash"] = safe_message_hash
 
         if SafeMessage.objects.filter(message_hash=safe_message_hash).exists():
             raise ValidationError(
-                f"Message with hash {safe_message_hash.hex()} for safe {safe_address} already exists in DB"
+                f"Message with hash {to_0x_hex_str(safe_message_hash)} for safe {safe_address} already exists in DB"
             )
 
+        # Preimage is encoded for the Safe. But if an EIP-1271 signature is used, owner's Safe will be called
+        # the preimage will be encoded again for the owner Safe. That's what needs to be signed by the user
+        # So original data -> EIP-191 or EIP-712 encoded -> Safe encoded data -> Owner encoded data
         safe_signatures = SafeSignature.parse_signature(
-            signature, safe_message_hash, message_hash
+            signature, safe_message_hash, safe_hash_preimage=safe_message_preimage
         )
         owner, signature_type = self.get_valid_owner_from_signatures(
             safe_signatures, safe_address, None
@@ -138,11 +168,14 @@ class SafeMessageSignatureSerializer(
         attrs["safe_message"] = safe_message
         signature: HexStr = attrs["signature"]
         safe_address = safe_message.safe
-        message_hash = get_hash_for_message(safe_message.message)
-        safe_message_hash = safe_message.message_hash
+        message_hash = fast_keccak(get_message_encoded(safe_message.message))
+        safe_message_hash, safe_message_preimage = (
+            get_safe_message_hash_and_preimage_for_message(safe_address, message_hash)
+        )
+        assert to_0x_hex_str(safe_message_hash) == safe_message.message_hash
 
         safe_signatures = SafeSignature.parse_signature(
-            signature, safe_message_hash, message_hash
+            signature, safe_message_hash, safe_hash_preimage=safe_message_preimage
         )
         owner, signature_type = self.get_valid_owner_from_signatures(
             safe_signatures, safe_address, safe_message
@@ -163,7 +196,7 @@ class SafeMessageSignatureSerializer(
         return safe_message_confirmation
 
 
-# Reponse serializers
+# Response serializers
 class SafeMessageConfirmationResponseSerializer(serializers.Serializer):
     created = serializers.DateTimeField()
     modified = serializers.DateTimeField()
@@ -185,8 +218,9 @@ class SafeMessageResponseSerializer(serializers.Serializer):
     safe_app_id = serializers.IntegerField()
     confirmations = serializers.SerializerMethodField()
     prepared_signature = serializers.SerializerMethodField()
+    origin = serializers.SerializerMethodField()
 
-    def get_confirmations(self, obj: SafeMessage) -> Dict[str, Any]:
+    def get_confirmations(self, obj: SafeMessage) -> dict[str, Any]:
         """
         Filters confirmations queryset
 
@@ -197,7 +231,7 @@ class SafeMessageResponseSerializer(serializers.Serializer):
             obj.confirmations, many=True
         ).data
 
-    def get_prepared_signature(self, obj: SafeMessage) -> Optional[str]:
+    def get_prepared_signature(self, obj: SafeMessage) -> str | None:
         """
         Prepared signature sorted
 
@@ -205,4 +239,7 @@ class SafeMessageResponseSerializer(serializers.Serializer):
         :return: Serialized queryset
         """
         signature = HexBytes(obj.build_signature())
-        return HexBytes(signature).hex() if signature else None
+        return to_0x_hex_str(HexBytes(signature)) if signature else None
+
+    def get_origin(self, obj: SafeMessage) -> str:
+        return obj.origin if isinstance(obj.origin, str) else json.dumps(obj.origin)

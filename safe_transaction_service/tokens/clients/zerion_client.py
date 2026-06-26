@@ -1,11 +1,9 @@
 from dataclasses import dataclass
-from typing import List, Optional
 
 from eth_typing import ChecksumAddress
+from safe_eth.eth import EthereumClient
+from safe_eth.eth.constants import NULL_ADDRESS
 from web3.exceptions import ContractLogicError
-
-from gnosis.eth import EthereumClient
-from gnosis.eth.constants import NULL_ADDRESS
 
 
 @dataclass
@@ -77,7 +75,7 @@ class ZerionTokenAdapterClient:
     def __init__(
         self,
         ethereum_client: EthereumClient,
-        adapter_address: Optional[ChecksumAddress] = None,
+        adapter_address: ChecksumAddress | None = None,
     ):
         self.ethereum_client = ethereum_client
         self.adapter_address = (
@@ -89,7 +87,7 @@ class ZerionTokenAdapterClient:
 
     def get_components(
         self, token_address: ChecksumAddress
-    ) -> Optional[List[UniswapComponent]]:
+    ) -> list[UniswapComponent] | None:
         try:
             return [
                 UniswapComponent(*component)
@@ -100,9 +98,7 @@ class ZerionTokenAdapterClient:
         except ContractLogicError:
             return None
 
-    def get_metadata(
-        self, token_address: ChecksumAddress
-    ) -> Optional[ZerionPoolMetadata]:
+    def get_metadata(self, token_address: ChecksumAddress) -> ZerionPoolMetadata | None:
         try:
             return ZerionPoolMetadata(
                 *self.contract.functions.getMetadata(token_address).call()

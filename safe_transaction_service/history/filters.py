@@ -3,23 +3,11 @@ from django.db.models import Q
 import django_filters
 from django_filters import rest_framework as filters
 from rest_framework.exceptions import ValidationError
+from safe_eth.eth.django.filters import EthereumAddressFilter, Keccak256Filter
 
-from gnosis.eth.django.filters import EthereumAddressFilter, Keccak256Filter
-from gnosis.eth.django.models import (
-    EthereumAddressField,
-    EthereumAddressV2Field,
-    Keccak256Field,
-    Uint256Field,
-)
+from safe_transaction_service.utils.filters import filter_overrides
 
 from .models import ModuleTransaction, MultisigTransaction
-
-filter_overrides = {
-    Uint256Field: {"filter_class": django_filters.NumberFilter},
-    Keccak256Field: {"filter_class": Keccak256Filter},
-    EthereumAddressField: {"filter_class": EthereumAddressFilter},
-    EthereumAddressV2Field: {"filter_class": EthereumAddressFilter},
-}
 
 
 class DelegateListFilter(filters.FilterSet):
@@ -30,7 +18,7 @@ class DelegateListFilter(filters.FilterSet):
 
     def filter_queryset(self, queryset):
         # Check at least one value is present
-        for name, value in self.form.cleaned_data.items():
+        for _name, value in self.form.cleaned_data.items():
             if value:
                 return super().filter_queryset(queryset)
         raise ValidationError("At least one query param must be provided")

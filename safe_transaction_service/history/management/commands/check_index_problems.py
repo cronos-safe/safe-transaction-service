@@ -1,9 +1,9 @@
 from django.conf import settings
 from django.core.management.base import BaseCommand
 
-from gnosis.eth import EthereumClient
-from gnosis.eth.constants import NULL_ADDRESS
-from gnosis.eth.contracts import get_safe_V1_3_0_contract
+from safe_eth.eth import EthereumClient
+from safe_eth.eth.constants import NULL_ADDRESS
+from safe_eth.eth.contracts import get_safe_V1_3_0_contract
 
 from ...models import MultisigTransaction, SafeLastStatus
 from ...services import IndexServiceProvider
@@ -86,7 +86,7 @@ class Command(BaseCommand):
 
                 addresses_to_reindex = set()
                 for safe_status, blockchain_nonce in zip(
-                    safe_statuses_list, blockchain_nonces
+                    safe_statuses_list, blockchain_nonces, strict=False
                 ):
                     address = safe_status.address
                     nonce = safe_status.nonce
@@ -113,8 +113,11 @@ class Command(BaseCommand):
                                 f"different from blockchain-nonce={blockchain_nonce}"
                             )
                         )
-                        if last_valid_transaction := MultisigTransaction.objects.last_valid_transaction(
-                            address
+                        if (
+                            last_valid_transaction
+                            := MultisigTransaction.objects.last_valid_transaction(
+                                address
+                            )
                         ):
                             self.stdout.write(
                                 self.style.WARNING(

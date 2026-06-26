@@ -1,19 +1,12 @@
 import itertools
 import operator
+from collections.abc import Iterable, Sequence
 from functools import cache, cached_property
 from logging import getLogger
 from threading import Lock
 from typing import (
     Any,
-    Dict,
-    Iterable,
-    List,
-    Optional,
-    Sequence,
-    Tuple,
-    Type,
     TypedDict,
-    Union,
     cast,
 )
 
@@ -21,20 +14,15 @@ import gevent
 from cachetools import TTLCache, cachedmethod
 from eth_abi import decode as decode_abi
 from eth_abi.exceptions import DecodingError
-from eth_typing import ChecksumAddress, HexStr
+from eth_typing import ABIFunction, ChecksumAddress, HexStr
 from eth_utils import function_abi_to_4byte_selector
 from hexbytes import HexBytes
-from web3 import Web3
-from web3._utils.abi import get_abi_input_names, get_abi_input_types, map_abi_data
-from web3._utils.normalizers import BASE_RETURN_NORMALIZERS
-from web3.contract import Contract
-from web3.types import ABIFunction
-
-from gnosis.eth.contracts import (
+from safe_eth.eth.contracts import (
     get_erc20_contract,
     get_erc721_contract,
     get_kyber_network_proxy_contract,
     get_multi_send_contract,
+    get_safe_to_l2_migration_contract,
     get_safe_V0_0_1_contract,
     get_safe_V1_0_0_contract,
     get_safe_V1_1_1_contract,
@@ -42,7 +30,12 @@ from gnosis.eth.contracts import (
     get_safe_V1_4_1_contract,
     get_uniswap_exchange_contract,
 )
-from gnosis.safe.multi_send import MultiSend
+from safe_eth.safe.multi_send import MultiSend
+from safe_eth.util.util import to_0x_hex_str
+from web3 import Web3
+from web3._utils.abi import get_abi_input_names, get_abi_input_types, map_abi_data
+from web3._utils.normalizers import BASE_RETURN_NORMALIZERS
+from web3.contract import Contract
 
 from safe_transaction_service.contracts.models import ContractAbi
 from safe_transaction_service.utils.utils import running_on_gevent
@@ -108,15 +101,15 @@ class ParameterDecoded(TypedDict):
 
 class DataDecoded(TypedDict):
     method: str
-    parameters: List[ParameterDecoded]
+    parameters: list[ParameterDecoded]
 
 
 class MultisendDecoded(TypedDict):
     operation: int
     to: ChecksumAddress
     value: str
-    data: Optional[HexStr]
-    data_decoded: Optional[DataDecoded]
+    data: HexStr | None
+    data_decoded: DataDecoded | None
 
 
 mutex = Lock()
@@ -171,7 +164,7 @@ class SafeTxDecoder:
 
     def __init__(self):
         logger.info("%s: Loading contract ABIs for decoding", self.__class__.__name__)
-        self.fn_selectors_with_abis: Dict[bytes, ABIFunction] = (
+        self.fn_selectors_with_abis: dict[bytes, ABIFunction] = (
             self._generate_selectors_with_abis_from_abis(self.get_supported_abis())
         )
         logger.info(
@@ -179,8 +172,8 @@ class SafeTxDecoder:
         )
 
     def get_abi_function(
-        self, data: bytes, address: Optional[ChecksumAddress] = None
-    ) -> Optional[ABIFunction]:
+        self, data: bytes, address: ChecksumAddress | None = None
+    ) -> ABIFunction | None:
         """
         :param data: transaction data
         :param address: contract address in case of ABI colliding
@@ -192,8 +185,8 @@ class SafeTxDecoder:
             return None
 
     def _decode_data(
-        self, data: Union[bytes, str], address: Optional[ChecksumAddress] = None
-    ) -> Tuple[str, List[Tuple[str, str, Any]]]:
+        self, data: bytes | str, address: ChecksumAddress | None = None
+    ) -> tuple[str, list[tuple[str, str, Any]]]:
         """
         Decode tx data
 
@@ -212,7 +205,10 @@ class SafeTxDecoder:
         params = data[4:]
         fn_abi = self.get_abi_function(data, address)
         if not fn_abi:
-            raise CannotDecode(data.hex())
+            # Check if the contract has a fallback call and return a minimal ABIFunction for fallback call
+            if address and self.has_contract_fallback_function(address):
+                return "fallback", []
+            raise CannotDecode(to_0x_hex_str(data))
         try:
             names = get_abi_input_names(fn_abi)
             types = get_abi_input_types(fn_abi)
@@ -220,14 +216,14 @@ class SafeTxDecoder:
             normalized = map_abi_data(BASE_RETURN_NORMALIZERS, types, decoded)
             values = map(self._parse_decoded_arguments, normalized)
         except (ValueError, DecodingError) as exc:
-            logger.warning("Cannot decode %s", data.hex())
+            logger.warning("Cannot decode %s", to_0x_hex_str(data))
             raise UnexpectedProblemDecoding(data) from exc
 
-        return fn_abi["name"], list(zip(names, types, values))
+        return fn_abi["name"], list(zip(names, types, values, strict=False))
 
     def _generate_selectors_with_abis_from_abi(
-        self, abi: ABIFunction
-    ) -> Dict[bytes, ABIFunction]:
+        self, abi: Sequence[ABIFunction]
+    ) -> dict[bytes, ABIFunction]:
         """
         :param abi: ABI
         :return: Dictionary with function selector as bytes and the ContractFunction
@@ -239,8 +235,8 @@ class SafeTxDecoder:
         }
 
     def _generate_selectors_with_abis_from_abis(
-        self, abis: Sequence[ABIFunction]
-    ) -> Dict[bytes, ABIFunction]:
+        self, abis: Sequence[Sequence[ABIFunction]]
+    ) -> dict[bytes, ABIFunction]:
         """
         :param abis: Contract ABIs. Last ABIs on the Sequence have preference if there's a collision on the
         selector
@@ -260,10 +256,10 @@ class SafeTxDecoder:
         prevent problems when deserializing in another languages like JavaScript
 
         :param value_decoded:
-        :return: Dict[str, Any]
+        :return: dict[str, Any]
         """
         if isinstance(value_decoded, bytes):
-            value_decoded = HexBytes(value_decoded).hex()
+            value_decoded = to_0x_hex_str(HexBytes(value_decoded))
         return value_decoded
 
     def add_abi(self, abi: ABIFunction) -> bool:
@@ -282,8 +278,8 @@ class SafeTxDecoder:
         return updated
 
     def decode_parameters_data(
-        self, data: bytes, parameters: Sequence[Dict[str, Any]]
-    ) -> Sequence[Dict[str, Any]]:
+        self, data: bytes, parameters: Sequence[dict[str, Any]]
+    ) -> Sequence[dict[str, Any]]:
         """
         Decode inner data for function parameters, e.g. Multisend `data` or `data` in Gnosis Safe `execTransaction`
 
@@ -294,8 +290,8 @@ class SafeTxDecoder:
         return parameters
 
     def decode_transaction_with_types(
-        self, data: Union[bytes, str], address: Optional[ChecksumAddress] = None
-    ) -> Tuple[str, List[ParameterDecoded]]:
+        self, data: bytes | str, address: ChecksumAddress | None = None
+    ) -> tuple[str, list[ParameterDecoded]]:
         """
         Decode tx data and return a list of dictionaries
 
@@ -317,8 +313,8 @@ class SafeTxDecoder:
         return fn_name, nested_parameters
 
     def decode_transaction(
-        self, data: Union[bytes, str], address: Optional[ChecksumAddress] = None
-    ) -> Tuple[str, Dict[str, Any]]:
+        self, data: bytes | str, address: ChecksumAddress | None = None
+    ) -> tuple[str, dict[str, Any]]:
         """
         Decode tx data and return all the parameters in the same dictionary
 
@@ -336,7 +332,7 @@ class SafeTxDecoder:
         }
         return fn_name, decoded_transactions
 
-    def get_supported_abis(self) -> Iterable[ABIFunction]:
+    def get_supported_abis(self) -> list[Sequence[ABIFunction]]:
         safe_abis = [
             get_safe_V0_0_1_contract(self.dummy_w3).abi,
             get_safe_V1_0_0_contract(self.dummy_w3).abi,
@@ -350,8 +346,8 @@ class SafeTxDecoder:
         return safe_abis
 
     def get_data_decoded(
-        self, data: Union[str, bytes], address: Optional[ChecksumAddress] = None
-    ) -> Optional[DataDecoded]:
+        self, data: str | bytes, address: ChecksumAddress | None = None
+    ) -> DataDecoded | None:
         """
         Return data prepared for serializing
 
@@ -376,14 +372,14 @@ class TxDecoder(SafeTxDecoder):
     """
 
     @cached_property
-    def multisend_abis(self) -> List[ABIFunction]:
+    def multisend_abis(self) -> list[Sequence[ABIFunction]]:
         return [get_multi_send_contract(self.dummy_w3).abi]
 
     @cached_property
-    def multisend_fn_selectors_with_abis(self) -> Dict[bytes, ABIFunction]:
+    def multisend_fn_selectors_with_abis(self) -> dict[bytes, ABIFunction]:
         return self._generate_selectors_with_abis_from_abis(self.multisend_abis)
 
-    def decode_multisend_data(self, data: Union[bytes, str]) -> List[MultisendDecoded]:
+    def decode_multisend_data(self, data: bytes | str) -> list[MultisendDecoded]:
         """
         Decodes Multisend raw data to Multisend dictionary
 
@@ -397,7 +393,9 @@ class TxDecoder(SafeTxDecoder):
                     "operation": multisend_tx.operation.value,
                     "to": multisend_tx.to,
                     "value": str(multisend_tx.value),
-                    "data": multisend_tx.data.hex() if multisend_tx.data else None,
+                    "data": (
+                        to_0x_hex_str(multisend_tx.data) if multisend_tx.data else None
+                    ),
                     "data_decoded": self.get_data_decoded(
                         multisend_tx.data, address=multisend_tx.to
                     ),
@@ -407,7 +405,7 @@ class TxDecoder(SafeTxDecoder):
         except ValueError:
             logger.warning(
                 "Problem decoding multisend transaction with data=%s",
-                HexBytes(data).hex(),
+                to_0x_hex_str(HexBytes(data)),
                 exc_info=True,
             )
 
@@ -420,11 +418,11 @@ class TxDecoder(SafeTxDecoder):
         :return:
         """
         value_decoded = super()._parse_decoded_arguments(value_decoded)
-        if isinstance(value_decoded, (int, float)):
+        if isinstance(value_decoded, int | float):
             value_decoded = str(
                 value_decoded
             )  # Return numbers as `str` for json compatibility
-        elif isinstance(value_decoded, (list, tuple, set)):
+        elif isinstance(value_decoded, list | tuple | set):
             value_decoded = [
                 self._parse_decoded_arguments(e) for e in value_decoded
             ]  # Recursive parsing inside sequences
@@ -477,6 +475,9 @@ class TxDecoder(SafeTxDecoder):
         ]
 
         gnosis_safe = [gnosis_safe_allowance_module_abi]
+
+        safe_to_l2_migration = [get_safe_to_l2_migration_contract(self.dummy_w3).abi]
+
         erc_contracts = [
             get_erc721_contract(self.dummy_w3).abi,
             get_erc20_contract(self.dummy_w3).abi,
@@ -503,14 +504,15 @@ class TxDecoder(SafeTxDecoder):
             + sight_contracts
             + gnosis_protocol
             + gnosis_safe
+            + safe_to_l2_migration
             + erc_contracts
             + self.multisend_abis
             + supported_abis
         )
 
     def decode_parameters_data(
-        self, data: bytes, parameters: Sequence[Dict[str, Any]]
-    ) -> Sequence[Dict[str, Any]]:
+        self, data: bytes, parameters: Sequence[dict[str, Any]]
+    ) -> Sequence[dict[str, Any]]:
         """
         Decode inner data for function parameters, in this case Multisend `data` and
         `data` in Gnosis Safe `execTransaction`
@@ -547,26 +549,53 @@ class DbTxDecoder(TxDecoder):
     """
 
     cache_abis_by_address = TTLCache(maxsize=2048, ttl=60 * 5)  # 5 minutes of caching
+    cache_contract_abi_selectors_with_functions_by_address = TTLCache(
+        maxsize=2048, ttl=60 * 5
+    )  # 5 minutes of caching
 
     @cachedmethod(cache=operator.attrgetter("cache_abis_by_address"))
-    def get_contract_abi(
+    def get_contract_abi(self, address: ChecksumAddress) -> list[ABIFunction] | None:
+        """
+        Retrieves the ABI for the contract at the given address.
+
+        :param address: Contract address
+        :return: List of ABI data if found, `None` otherwise.
+        """
+        return (
+            ContractAbi.objects.filter(contracts__address=address)
+            .values_list("abi", flat=True)
+            .first()
+        )
+
+    def has_contract_fallback_function(self, address: ChecksumAddress) -> bool:
+        """
+        :param address: Contract address
+        :return: Fallback ABIFunction if found, `None` otherwise.
+        """
+        abi = self.get_contract_abi(address)
+        if not abi:
+            return False
+        return any(fn_abi.get("type") == "fallback" for fn_abi in abi)
+
+    @cachedmethod(
+        cache=operator.attrgetter(
+            "cache_contract_abi_selectors_with_functions_by_address"
+        )
+    )
+    def get_contract_abi_selectors_with_functions(
         self, address: ChecksumAddress
-    ) -> Optional[Dict[bytes, ABIFunction]]:
+    ) -> dict[bytes, ABIFunction] | None:
         """
         :param address: Contract address
         :return: Dictionary of function selects with ABIFunction if found, `None` otherwise
         """
-        abis = (
-            ContractAbi.objects.filter(contracts__address=address)
-            .order_by("relevance")
-            .values_list("abi", flat=True)
-        )
-        if abis:
-            return self._generate_selectors_with_abis_from_abi(abis[0])
+        abi = self.get_contract_abi(address)
+        if abi:
+            return self._generate_selectors_with_abis_from_abi(abi)
 
     def get_abi_function(
-        self, data: bytes, address: Optional[ChecksumAddress] = None
-    ) -> Optional[ABIFunction]:
+        self, data: bytes, address: ChecksumAddress | None = None
+    ) -> ABIFunction | None:
         """
         :param data: transaction data
         :param address: contract address in case of ABI colliding
@@ -577,7 +606,9 @@ class DbTxDecoder(TxDecoder):
         if selector in self.fn_selectors_with_abis:
             # Try to use specific ABI if address provided
             if address:
-                contract_selectors_with_abis = self.get_contract_abi(address)
+                contract_selectors_with_abis = (
+                    self.get_contract_abi_selectors_with_functions(address)
+                )
                 if (
                     contract_selectors_with_abis
                     and selector in contract_selectors_with_abis
@@ -587,7 +618,7 @@ class DbTxDecoder(TxDecoder):
                     return contract_selectors_with_abis[selector]
             return self.fn_selectors_with_abis[selector]
 
-    def get_supported_abis(self) -> Iterable[Type[Contract]]:
+    def get_supported_abis(self) -> Iterable[type[Contract]]:
         supported_abis = super().get_supported_abis()
         db_abis = (
             ContractAbi.objects.all()

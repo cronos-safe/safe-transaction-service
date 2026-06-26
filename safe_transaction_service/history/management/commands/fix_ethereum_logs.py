@@ -1,6 +1,6 @@
 from django.core.management.base import BaseCommand
 
-from gnosis.eth import EthereumClientProvider
+from safe_eth.eth import get_auto_ethereum_client
 
 from ...models import EthereumTx
 from ...utils import clean_receipt_log
@@ -11,7 +11,7 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         # We need to add `address` to the logs, so we exclude empty logs and logs already containing `address`
-        ethereum_client = EthereumClientProvider()
+        ethereum_client = get_auto_ethereum_client()
         queryset = EthereumTx.objects.exclude(logs__0__has_key="address").exclude(
             logs=[]
         )
@@ -28,7 +28,9 @@ class Command(BaseCommand):
             tx_hashes = [ethereum_tx.tx_hash for ethereum_tx in ethereum_txs]
             try:
                 tx_receipts = ethereum_client.get_transaction_receipts(tx_hashes)
-                for ethereum_tx, tx_receipt in zip(ethereum_txs, tx_receipts):
+                for ethereum_tx, tx_receipt in zip(
+                    ethereum_txs, tx_receipts, strict=False
+                ):
                     ethereum_tx.logs = [
                         clean_receipt_log(log) for log in tx_receipt["logs"]
                     ]
@@ -40,7 +42,7 @@ class Command(BaseCommand):
                         f"Fixed {processed} ethereum logs. {total} remaining to be fixed"
                     )
                 )
-            except IOError:
+            except OSError:
                 self.stdout.write(
                     self.style.WARNING(
                         "Node connection error when retrieving tx receipts"

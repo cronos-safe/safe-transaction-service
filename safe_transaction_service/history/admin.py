@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any
 
 from django import forms
 from django.contrib import admin
@@ -9,11 +9,10 @@ from django.http import HttpRequest
 
 from hexbytes import HexBytes
 from rest_framework.authtoken.admin import TokenAdmin
-
-from gnosis.eth import EthereumClientProvider
-from gnosis.safe import SafeTx
-
-from safe_transaction_service.utils.admin import AdvancedAdminSearchMixin
+from safe_eth.eth import get_auto_ethereum_client
+from safe_eth.eth.django.admin import AdvancedAdminSearchMixin
+from safe_eth.safe import SafeTx
+from safe_eth.util.util import to_0x_hex_str
 
 from .models import (
     Chain,
@@ -33,7 +32,6 @@ from .models import (
     SafeLastStatus,
     SafeMasterCopy,
     SafeStatus,
-    WebHook,
 )
 from .services import IndexServiceProvider
 from .utils import HexField
@@ -209,6 +207,7 @@ class InternalTxAdmin(AdvancedAdminSearchMixin, admin.ModelAdmin):
         "-ethereum_tx__transaction_index",
         "-pk",
     ]
+    readonly_fields = ("timestamp", "block_number")
     raw_id_fields = ("ethereum_tx",)
     search_fields = [
         "==block_number",
@@ -231,9 +230,7 @@ class InternalTxDecodedOfficialListFilter(admin.SimpleListFilter):
             return queryset.filter(
                 Q(
                     Exists(
-                        SafeContract.objects.filter(
-                            address=OuterRef("internal_tx___from")
-                        )
+                        SafeContract.objects.filter(address=OuterRef("safe_address"))
                     )
                 )  # Just Safes indexed
                 | Q(function_name="setup")  # Safes pending to be indexed
@@ -260,10 +257,11 @@ class InternalTxDecodedAdmin(AdvancedAdminSearchMixin, admin.ModelAdmin):
         "-internal_tx_id",
     ]
     raw_id_fields = ("internal_tx",)
+    readonly_fields = ("safe_address",)
     search_fields = [
         "==function_name",
         "==internal_tx__to",
-        "==internal_tx___from",
+        "==safe_address",
         "==internal_tx__ethereum_tx__tx_hash",
         "==internal_tx__block_number",
     ]
@@ -312,7 +310,7 @@ class MultisigConfirmationAdmin(AdvancedAdminSearchMixin, admin.ModelAdmin):
     ]
 
     @admin.display()
-    def block_number(self, obj: MultisigConfirmation) -> Optional[int]:
+    def block_number(self, obj: MultisigConfirmation) -> int | None:
         if obj.ethereum_tx:
             return obj.ethereum_tx.block_id
 
@@ -408,7 +406,7 @@ class MultisigTransactionAdmin(AdvancedAdminSearchMixin, admin.ModelAdmin):
         # Calculate new tx hash
         # All the numbers are decimals, they need to be parsed as integers for SafeTx
         safe_tx = SafeTx(
-            EthereumClientProvider(),
+            get_auto_ethereum_client(),
             obj.safe,
             obj.to,
             int(obj.value),
@@ -447,7 +445,7 @@ class ModuleTransactionAdmin(AdvancedAdminSearchMixin, admin.ModelAdmin):
     search_fields = ["==safe", "==module", "==to"]
 
     def data_hex(self, o: ModuleTransaction):
-        return HexBytes(o.data.tobytes()).hex() if o.data else None
+        return to_0x_hex_str(HexBytes(o.data)) if o.data else None
 
     def tx_hash(self, o: ModuleTransaction):
         return o.internal_tx.ethereum_tx_id
@@ -520,7 +518,7 @@ class SafeContractERC20ListFilter(admin.SimpleListFilter):
         )
 
     def queryset(self, request, queryset):
-        current_block_number = EthereumClientProvider().current_block_number
+        current_block_number = get_auto_ethereum_client().current_block_number
         condition = {"erc20_block_number__gte": current_block_number - 200}
         if self.value() == "YES":
             return queryset.filter(**condition)
@@ -533,10 +531,11 @@ class SafeContractAdmin(AdvancedAdminSearchMixin, admin.ModelAdmin):
     inlines = (SafeContractDelegateInline,)
     list_display = (
         "created_block_number",
+        "banned",
         "address",
         "ethereum_tx_id",
     )
-    list_filter = (SafeContractERC20ListFilter,)
+    list_filter = (SafeContractERC20ListFilter, "banned")
     list_select_related = ("ethereum_tx",)
     ordering = ["-ethereum_tx__block_id"]
     raw_id_fields = ("ethereum_tx",)
@@ -638,31 +637,3 @@ class SafeLastStatusAdmin(AdvancedAdminSearchMixin, admin.ModelAdmin):
 @admin.register(SafeStatus)
 class SafeStatusAdmin(SafeLastStatusAdmin):
     pass
-
-
-@admin.register(WebHook)
-class WebHookAdmin(AdvancedAdminSearchMixin, admin.ModelAdmin):
-    list_display = (
-        "pk",
-        "url",
-        "authorization",
-        "address",
-        "pending_multisig_transaction",
-        "new_confirmation",
-        "new_executed_multisig_transaction",
-        "new_incoming_transaction",
-        "new_safe",
-        "new_module_transaction",
-        "new_outgoing_transaction",
-    )
-    list_filter = (
-        "pending_multisig_transaction",
-        "new_confirmation",
-        "new_executed_multisig_transaction",
-        "new_incoming_transaction",
-        "new_safe",
-        "new_module_transaction",
-        "new_outgoing_transaction",
-    )
-    ordering = ["-pk"]
-    search_fields = ["==address", "==url"]
