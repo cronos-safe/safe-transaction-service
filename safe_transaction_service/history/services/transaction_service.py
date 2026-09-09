@@ -1,17 +1,22 @@
 import logging
 import pickle
+import zlib
 from collections import defaultdict
-from datetime import timedelta
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from collections.abc import Sequence
+from datetime import datetime, timedelta
+from typing import Any
 
-from django.db.models import Case, Exists, F, OuterRef, QuerySet, Subquery, Value, When
+from django.conf import settings
+from django.db import connection
+from django.db.models import F, QuerySet
+from django.db.models.expressions import RawSQL
 from django.utils import timezone
 
 from eth_typing import ChecksumAddress, HexStr
+from hexbytes import HexBytes
 from redis import Redis
-
-from gnosis.eth import EthereumClient, EthereumClientProvider
-from gnosis.eth.django.models import Uint256Field
+from safe_eth.eth import EthereumClient, get_auto_ethereum_client
+from safe_eth.eth.utils import fast_to_checksum_address
 
 from safe_transaction_service.tokens.models import Token
 from safe_transaction_service.utils.redis import get_redis
@@ -20,17 +25,17 @@ from ..models import (
     ERC20Transfer,
     ERC721Transfer,
     EthereumTx,
-    EthereumTxCallType,
     InternalTx,
     ModuleTransaction,
     MultisigTransaction,
-    SafeContract,
+    SafeRelevantTransaction,
     TransferDict,
 )
 from ..serializers import (
     EthereumTxWithTransfersResponseSerializer,
     SafeModuleTransactionWithTransfersResponseSerializer,
     SafeMultisigTransactionWithTransfersResponseSerializer,
+    SafeMultisigTransactionWithTransfersResponseSerializerV2,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,7 +51,7 @@ class TransactionServiceException(Exception):
 class TransactionServiceProvider:
     def __new__(cls):
         if not hasattr(cls, "instance"):
-            cls.instance = TransactionService(EthereumClientProvider(), get_redis())
+            cls.instance = TransactionService(get_auto_ethereum_client(), get_redis())
         return cls.instance
 
     @classmethod
@@ -59,6 +64,7 @@ class TransactionService:
     def __init__(self, ethereum_client: EthereumClient, redis: Redis):
         self.ethereum_client = ethereum_client
         self.redis = redis
+        self.cache_expiration = settings.CACHE_ALL_TXS_VIEW
 
     #  Cache methods ---------------------------------
     def get_cache_key(self, safe_address: str, tx_id: str):
@@ -66,20 +72,20 @@ class TransactionService:
 
     def get_txs_from_cache(
         self, safe_address: str, ids_to_search: Sequence[str]
-    ) -> List[AnySafeTransaction]:
+    ) -> list[AnySafeTransaction]:
         keys_to_search = [
             self.get_cache_key(safe_address, id_to_search)
             for id_to_search in ids_to_search
         ]
         return [
-            pickle.loads(data) if data else None
+            pickle.loads(zlib.decompress(data)) if data else None
             for data in self.redis.mget(keys_to_search)
         ]
 
     def store_txs_in_cache(
         self,
         safe_address: str,
-        ids_with_txs: Tuple[str, List[AnySafeTransaction]],
+        ids_with_txs: tuple[str, list[AnySafeTransaction]],
     ):
         """
         Store executed transactions older than 10 minutes, using `ethereum_tx_hash` as key (for
@@ -90,7 +96,9 @@ class TransactionService:
         """
         # Just store executed transactions older than 10 minutes
         to_store = {
-            self.get_cache_key(safe_address, tx_hash): pickle.dumps(txs)
+            self.get_cache_key(safe_address, tx_hash): zlib.compress(
+                pickle.dumps(txs), level=settings.CACHE_ALL_TXS_COMPRESSION_LEVEL
+            )
             for tx_hash, txs in ids_with_txs
             if all(
                 tx.execution_date
@@ -102,206 +110,37 @@ class TransactionService:
             pipe = self.redis.pipeline()
             pipe.mset(to_store)
             for key in to_store.keys():
-                pipe.expire(key, 60 * 60)  # Expire in one hour
+                pipe.expire(key, self.cache_expiration)
             pipe.execute()
 
     # End of cache methods ----------------------------
 
-    def get_count_relevant_txs_for_safe(self, safe_address: ChecksumAddress) -> int:
-        """
-        This method searches multiple tables and count every tx or event for a Safe.
-        It will return the same or higher value if compared to counting ``get_all_tx_identifiers``
-        as that method will group some transactions (for example, 3 ERC20 can be grouped in a ``MultisigTransaction``,
-        so it will be ``1`` element for ``get_all_tx_identifiers`` but ``4`` for this function.
-
-        This query should be pretty fast, and it's meant to be used for invalidating caches.
-
-        :param safe_address:
-        :return: number of relevant txs for a Safe
-        """
-
-        return SafeContract.objects.get_count_relevant_txs_for_safe(safe_address)
-
     def get_all_tx_identifiers(
         self,
         safe_address: str,
-        executed: bool = False,
-        queued: bool = True,
-        trusted: bool = True,
     ) -> QuerySet:
         """
-        Build a queryset with identifiers (`safeTxHash` or `txHash`) for every tx for a Safe for paginated filtering.
-        In the case of Multisig Transactions, as some of them are not mined, we use the `safeTxHash`.
-        Criteria for building this list:
-          - Return ``SafeTxHash`` for every MultisigTx (even not executed)
-          - The endpoint should only show incoming transactions that have been mined
-          - The transactions should be sorted by execution date. If an outgoing transaction doesn't have an execution
-          date the execution date of the transaction with the same nonce that has been executed should be taken.
-          - Incoming and outgoing transfers or Eth/tokens must be under a Multisig/Module Tx if triggered by one.
-          Otherwise they should have their own entry in the list using a EthereumTx
+        Build a queryset with all the executed `ethereum transactions` for a Safe for paginated filtering.
+        That includes:
+        - MultisigTransactions
+        - ModuleTransactions
+        - ERC20/721 transfers
+        - Incoming native token transfers
 
         :param safe_address:
-        :param executed: By default `False`, all transactions are returned. With `True`, just txs executed are returned.
-        :param queued: By default `True`, all transactions are returned. With `False`, just txs with
-        `nonce < current Safe Nonce` are returned.
-        :param trusted: By default `True`, just txs that are trusted are returned (with at least one confirmation,
-        sent by a delegate or indexed). With `False` all txs are returned
-        :return: List with tx hashes sorted by date (newest first)
+        :return: Querylist with elements from `SafeRelevantTransaction` model
         """
         logger.debug(
-            "Safe=%s Getting all tx identifiers executed=%s queued=%s trusted=%s",
+            "[%s] Getting all tx identifiers",
             safe_address,
-            executed,
-            queued,
-            trusted,
         )
-        # If tx is not mined, get the execution date of a tx mined with the same nonce
-        case = Case(
-            When(
-                ethereum_tx__block=None,
-                then=MultisigTransaction.objects.filter(
-                    safe=OuterRef("safe"), nonce=OuterRef("nonce")
-                )
-                .exclude(ethereum_tx__block=None)
-                .values("ethereum_tx__block__timestamp"),
-            ),
-            default=F("ethereum_tx__block__timestamp"),
+        return SafeRelevantTransaction.objects.filter(safe=safe_address).order_by(
+            "-timestamp", "ethereum_tx_id"
         )
-        multisig_safe_tx_ids = (
-            MultisigTransaction.objects.filter(safe=safe_address)
-            .annotate(
-                execution_date=case,
-                block=F("ethereum_tx__block_id"),
-                safe_nonce=F("nonce"),
-            )
-            .values(
-                "safe_tx_hash",  # Tricky, we will merge SafeTx hashes with EthereumTx hashes
-                "execution_date",
-                "created",
-                "block",
-                "safe_nonce",
-            )
-            .order_by("-execution_date")
-        )
-        # Block is needed to get stable ordering
-
-        if not queued:  # Filter out txs with nonce >= Safe nonce
-            last_nonce_query = (
-                MultisigTransaction.objects.filter(safe=safe_address)
-                .executed()
-                .order_by("-nonce")
-                .values("nonce")
-            )
-            multisig_safe_tx_ids = multisig_safe_tx_ids.filter(
-                nonce__lte=Subquery(last_nonce_query[:1])
-            )
-
-        if trusted:  # Just show trusted transactions
-            multisig_safe_tx_ids = multisig_safe_tx_ids.trusted()
-
-        if executed:
-            multisig_safe_tx_ids = multisig_safe_tx_ids.executed()
-
-        # Get module txs
-        module_tx_ids = (
-            ModuleTransaction.objects.filter(safe=safe_address)
-            .annotate(
-                execution_date=F("internal_tx__timestamp"),
-                block=F("internal_tx__block_number"),
-                safe_nonce=Value(0, output_field=Uint256Field()),
-            )
-            .values(
-                "internal_tx__ethereum_tx_id",
-                "execution_date",
-                "created",
-                "block",
-                "safe_nonce",
-            )
-            .order_by("-execution_date")
-        )
-
-        multisig_hashes = MultisigTransaction.objects.filter(
-            safe=safe_address, ethereum_tx_id=OuterRef("ethereum_tx_id")
-        )
-        module_hashes = ModuleTransaction.objects.filter(
-            safe=safe_address, internal_tx__ethereum_tx_id=OuterRef("ethereum_tx_id")
-        )
-
-        # Get incoming/outgoing tokens not included on Multisig or Module txs.
-        # Outgoing tokens can be triggered by another user after the Safe calls `approve`, that's why it will not
-        # always appear as a MultisigTransaction
-        erc20_tx_ids = (
-            ERC20Transfer.objects.to_or_from(safe_address)
-            .exclude(Exists(multisig_hashes))
-            .exclude(Exists(module_hashes))
-            .annotate(
-                execution_date=F("timestamp"),
-                created=F("timestamp"),
-                block=F("block_number"),
-                safe_nonce=Value(0, output_field=Uint256Field()),
-            )
-            .values(
-                "ethereum_tx_id", "execution_date", "created", "block", "safe_nonce"
-            )
-            .distinct()
-            .order_by("-execution_date")
-        )
-
-        erc721_tx_ids = (
-            ERC721Transfer.objects.to_or_from(safe_address)
-            .exclude(Exists(multisig_hashes))
-            .exclude(Exists(module_hashes))
-            .annotate(
-                execution_date=F("timestamp"),
-                created=F("timestamp"),
-                block=F("block_number"),
-                safe_nonce=Value(0, output_field=Uint256Field()),
-            )
-            .values(
-                "ethereum_tx_id", "execution_date", "created", "block", "safe_nonce"
-            )
-            .distinct()
-            .order_by("-execution_date")
-        )
-
-        # Get incoming ether txs not included on Multisig or Module txs
-        internal_tx_ids = (
-            InternalTx.objects.filter(
-                call_type=EthereumTxCallType.CALL.value,
-                value__gt=0,
-                to=safe_address,
-            )
-            .exclude(Exists(multisig_hashes))
-            .exclude(Exists(module_hashes))
-            .annotate(
-                execution_date=F("timestamp"),
-                created=F("timestamp"),
-                block=F("block_number"),
-                safe_nonce=Value(0, output_field=Uint256Field()),
-            )
-            .values(
-                "ethereum_tx_id", "execution_date", "created", "block", "safe_nonce"
-            )
-            .distinct()
-            .order_by("-execution_date")
-        )
-
-        # Tricky, we merge SafeTx hashes with EthereumTx hashes
-        queryset = (
-            multisig_safe_tx_ids.union(erc20_tx_ids, all=True)
-            .union(erc721_tx_ids, all=True)
-            .union(internal_tx_ids, all=True)
-            .union(module_tx_ids, all=True)
-            .order_by("-execution_date", "-safe_nonce", "block", "-created")
-        )
-        # Order by block because `block_number < NULL`, so txs mined will have preference,
-        # and `created` to get always the same ordering with not executed transactions, as they will share
-        # the same `execution_date` that the mined tx
-        return queryset
 
     def get_all_txs_from_identifiers(
         self, safe_address: str, ids_to_search: Sequence[str]
-    ) -> List[AnySafeTransaction]:
+    ) -> list[AnySafeTransaction]:
         """
         Now that we know how to paginate, we retrieve the real transactions
 
@@ -311,18 +150,19 @@ class TransactionService:
         """
 
         logger.debug(
-            "Safe=%s Getting %d txs from identifiers", safe_address, len(ids_to_search)
+            "[%s] Getting %d txs from identifiers", safe_address, len(ids_to_search)
         )
         ids_with_cached_txs = {
             id_to_search: cached_txs
             for id_to_search, cached_txs in zip(
                 ids_to_search,
                 self.get_txs_from_cache(safe_address, ids_to_search),
+                strict=False,
             )
             if cached_txs
         }
         logger.debug(
-            "Safe=%s Got %d cached txs from identifiers",
+            "[%s] Got %d cached txs from identifiers",
             safe_address,
             len(ids_with_cached_txs),
         )
@@ -332,53 +172,60 @@ class TransactionService:
             if hash_to_search not in ids_with_cached_txs
         ]
         logger.debug(
-            "Safe=%s %d not cached txs from identifiers",
+            "[%s] %d not cached txs from identifiers",
             safe_address,
             len(ids_not_cached),
         )
-        ids_with_multisig_txs: Dict[HexStr, List[MultisigTransaction]] = {
-            multisig_tx.safe_tx_hash: [multisig_tx]
-            for multisig_tx in MultisigTransaction.objects.filter(
-                safe=safe_address, safe_tx_hash__in=ids_not_cached
+        ids_with_multisig_txs: dict[HexStr, list[MultisigTransaction]] = {}
+        number_multisig_txs = 0
+        for multisig_tx in (
+            MultisigTransaction.objects.filter(
+                safe=safe_address, ethereum_tx_id__in=ids_not_cached
             )
             .with_confirmations_required()
             .prefetch_related("confirmations")
             .select_related("ethereum_tx__block")
             .order_by("-nonce", "-created")
-        }
+        ):
+            ids_with_multisig_txs.setdefault(multisig_tx.ethereum_tx_id, []).append(
+                multisig_tx
+            )
+            number_multisig_txs += 1
         logger.debug(
-            "Safe=%s Got %d Multisig txs from identifiers",
+            "[%s] Got %d Multisig txs from identifiers",
             safe_address,
-            len(ids_with_multisig_txs),
+            number_multisig_txs,
         )
 
-        ids_with_module_txs: Dict[HexStr, List[ModuleTransaction]] = {}
+        ids_with_module_txs: dict[HexStr, list[ModuleTransaction]] = {}
+        number_module_txs = 0
         for module_tx in ModuleTransaction.objects.filter(
             safe=safe_address, internal_tx__ethereum_tx__in=ids_not_cached
         ).select_related("internal_tx"):
             ids_with_module_txs.setdefault(
                 module_tx.internal_tx.ethereum_tx_id, []
             ).append(module_tx)
+            number_module_txs += 1
         logger.debug(
-            "Safe=%s Got %d Module txs from identifiers",
+            "[%s] Got %d Module txs from identifiers",
             safe_address,
-            len(ids_with_module_txs),
+            number_module_txs,
         )
 
-        ids_with_plain_ethereum_txs: Dict[HexStr, List[EthereumTx]] = {
+        ids_with_plain_ethereum_txs: dict[HexStr, list[EthereumTx]] = {
             ethereum_tx.tx_hash: [ethereum_tx]
             for ethereum_tx in EthereumTx.objects.filter(
                 tx_hash__in=ids_not_cached
             ).select_related("block")
         }
         logger.debug(
-            "Safe=%s Got %d Plain Ethereum txs from identifiers",
+            "[%s] Got %d Plain Ethereum txs from identifiers",
             safe_address,
             len(ids_with_plain_ethereum_txs),
         )
 
-        # We also need the in/out transfers for the MultisigTxs, we add the MultisigTx Ethereum Tx hashes
-        # to not cached ids
+        # We also need the in/out transfers for the MultisigTxs,
+        # add the MultisigTx Ethereum Tx hashes to not cached ids
         all_ids = ids_not_cached + [
             multisig_tx.ethereum_tx_id
             for multisig_txs in ids_with_multisig_txs.values()
@@ -401,14 +248,14 @@ class TransactionService:
 
         # Build dict of transfers for optimizing access
         transfer_dict = defaultdict(list)
-        transfers: List[TransferDict] = InternalTx.objects.union_ether_and_token_txs(
+        transfers: list[TransferDict] = InternalTx.objects.union_ether_and_token_txs(
             erc20_queryset, erc721_queryset, ether_queryset
         )
         for transfer in transfers:
             transfer_dict[transfer["transaction_hash"]].append(transfer)
 
         logger.debug(
-            "Safe=%s Got %d Transfers from identifiers", safe_address, len(transfers)
+            "[%s] Got %d Transfers from identifiers", safe_address, len(transfers)
         )
 
         # Add available information about the token on database for the transfers
@@ -423,7 +270,7 @@ class TransactionService:
             )
         }
         logger.debug(
-            "Safe=%s Got %d tokens for transfers from database",
+            "[%s] Got %d tokens for transfers from database",
             safe_address,
             len(tokens),
         )
@@ -434,7 +281,7 @@ class TransactionService:
         # Build the list
         def get_the_transactions(
             transaction_id: str,
-        ) -> List[MultisigTransaction | ModuleTransaction | EthereumTx]:
+        ) -> list[MultisigTransaction | ModuleTransaction | EthereumTx]:
             """
             :param transaction_id: SafeTxHash (in case of a ``MultisigTransaction``) or Ethereum ``TxHash`` for the rest
             :return: Transactions for the transaction id, with transfers appended
@@ -442,7 +289,7 @@ class TransactionService:
             if result := ids_with_cached_txs.get(transaction_id):
                 return result
 
-            result: Optional[Union[MultisigTransaction, ModuleTransaction, EthereumTx]]
+            result: MultisigTransaction | ModuleTransaction | EthereumTx | None
             if result := ids_with_multisig_txs.get(transaction_id):
                 for multisig_tx in result:
                     # Populate transfers
@@ -471,7 +318,7 @@ class TransactionService:
                 )
 
         logger.debug(
-            "Safe=%s Got all transactions from tx identifiers. Storing in cache",
+            "[%s] Got all transactions from tx identifiers. Storing in cache",
             safe_address,
         )
         ids_with_txs = [
@@ -480,7 +327,7 @@ class TransactionService:
         ]
         self.store_txs_in_cache(safe_address, ids_with_txs)
         logger.debug(
-            "Safe=%s Got all transactions from tx identifiers. Stored in cache",
+            "[%s] Got all transactions from tx identifiers. Stored in cache",
             safe_address,
         )
         return list(
@@ -488,8 +335,8 @@ class TransactionService:
         )  # Sorted already by execution_date
 
     def serialize_all_txs(
-        self, models: List[AnySafeTransaction]
-    ) -> List[Dict[str, Any]]:
+        self, models: list[AnySafeTransaction]
+    ) -> list[dict[str, Any]]:
         logger.debug("Serializing all transactions")
         results = []
         for model in models:
@@ -508,3 +355,343 @@ class TransactionService:
 
         logger.debug("Serialized all transactions")
         return results
+
+    def serialize_all_txs_v2(
+        self, models: list[AnySafeTransaction]
+    ) -> list[dict[str, Any]]:
+        logger.debug("Serializing all transactions")
+        results = []
+        for model in models:
+            model_type = type(model)
+            if model_type == EthereumTx:
+                serializer = EthereumTxWithTransfersResponseSerializer
+            elif model_type == ModuleTransaction:
+                serializer = SafeModuleTransactionWithTransfersResponseSerializer
+            elif model_type == MultisigTransaction:
+                serializer = SafeMultisigTransactionWithTransfersResponseSerializerV2
+            else:
+                raise ValueError(f"Type={model_type} not expected, cannot serialize")
+            serialized = serializer(model)
+            # serialized.is_valid(raise_exception=True)
+            results.append(serialized.data)
+
+        logger.debug("Serialized all transactions")
+        return results
+
+    def get_export_transactions(
+        self,
+        safe_address: ChecksumAddress,
+        execution_date_gte: datetime | None = None,
+        execution_date_lte: datetime | None = None,
+        limit: int = 1000,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """
+        Get transactions optimized for CSV export using raw SQL queries
+
+        :param safe_address: Safe address to get transactions for
+        :param execution_date_gte: Filter transactions executed after this date
+        :param execution_date_lte: Filter transactions executed before this date
+        :param limit: Maximum number of transactions to return
+        :param offset: Number of transactions to skip
+        :return: Tuple of (transactions, total_count)
+        """
+        logger.debug(
+            "[%s] Getting export transactions with raw SQL: gte=%s, lte=%s, limit=%d, offset=%d",
+            safe_address,
+            execution_date_gte,
+            execution_date_lte,
+            limit,
+            offset,
+        )
+
+        # Build timestamp conditions for each subquery
+        erc20_timestamp_conditions = ""
+        erc721_timestamp_conditions = ""
+        native_timestamp_conditions = ""
+
+        if execution_date_gte:
+            assert type(execution_date_gte) is datetime
+            erc20_timestamp_conditions += (
+                f" AND erc20.timestamp >= '{execution_date_gte}'"
+            )
+            erc721_timestamp_conditions += (
+                f" AND erc721.timestamp >= '{execution_date_gte}'"
+            )
+            native_timestamp_conditions += (
+                f" AND itx.timestamp >= '{execution_date_gte}'"
+            )
+
+        if execution_date_lte:
+            assert type(execution_date_lte) is datetime
+            erc20_timestamp_conditions += (
+                f" AND erc20.timestamp <= '{execution_date_lte}'"
+            )
+            erc721_timestamp_conditions += (
+                f" AND erc721.timestamp <= '{execution_date_lte}'"
+            )
+            native_timestamp_conditions += (
+                f" AND itx.timestamp <= '{execution_date_lte}'"
+            )
+
+        # Main query that unions all transaction types with their transfers
+        main_query = f"""
+        WITH export_data AS (
+            -- ERC20 Transfers
+            SELECT
+                encode(%s, 'hex') as safe_address,
+                encode(COALESCE(erc20._from, modtx.module), 'hex') as from_address,
+                encode(COALESCE(erc20.to, modtx.to), 'hex') as to_address,
+                erc20.value::text as amount,
+                'erc20' as asset_type,
+                encode(erc20.address, 'hex') as asset_address,
+                t.symbol as asset_symbol,
+                t.decimals as asset_decimals,
+                encode(mt.proposer, 'hex') as proposer_address,
+                mt.created as proposed_at,
+                encode(COALESCE(et._from, modtx.module), 'hex') as executor_address,
+                erc20.timestamp as execution_date,
+                erc20.timestamp as executed_at,
+                COALESCE(mt.origin->> 'note', '') as note,
+                encode(erc20.ethereum_tx_id, 'hex') as transaction_hash,
+                encode(COALESCE(mt.to, modtx.to), 'hex') as contract_address,
+                -- Just get the nonces from the provided Safe
+                CASE WHEN mt.safe = %s THEN mt.nonce ELSE NULL END AS nonce,
+                -- Assigns a row number to each ERC20 transfer grouped by tx and log index.
+                -- Prioritizes module > multisig > standalone using execution time as tiebreaker.
+                ROW_NUMBER() OVER (
+                    PARTITION BY erc20.ethereum_tx_id, erc20.log_index
+                    ORDER BY
+                        CASE
+                            WHEN modtx.internal_tx_id IS NOT NULL THEN 1
+                        WHEN mt.safe IS NOT NULL THEN 2
+                        ELSE 3
+                        END,
+                    COALESCE(mt.created, erc20.timestamp)
+                ) AS rn
+            FROM history_erc20transfer erc20
+            JOIN history_saferelevanttransaction rel ON rel.safe = %s AND rel.ethereum_tx_id = erc20.ethereum_tx_id
+            JOIN history_ethereumtx et ON rel.ethereum_tx_id = et.tx_hash
+            LEFT JOIN history_multisigtransaction mt ON erc20.ethereum_tx_id = mt.ethereum_tx_id
+            LEFT JOIN history_internaltx itx ON itx.ethereum_tx_id = erc20.ethereum_tx_id
+            LEFT JOIN history_moduletransaction modtx ON modtx.internal_tx_id = itx.id
+            LEFT JOIN tokens_token t ON erc20.address = t.address
+            WHERE (erc20.to = %s OR erc20._from = %s){erc20_timestamp_conditions}
+
+            UNION ALL
+            -- ERC721 Transfers
+            SELECT
+                encode(%s, 'hex') as safe_address,
+                encode(COALESCE(erc721._from, modtx.module), 'hex') as from_address,
+                encode(COALESCE(erc721.to, modtx.to), 'hex') as to_address,
+                '1' as amount,
+                'erc721' as asset_type,
+                encode(erc721.address, 'hex') as asset_address,
+                t.symbol as asset_symbol,
+                t.decimals as asset_decimals,
+                encode(mt.proposer, 'hex') as proposer_address,
+                mt.created as proposed_at,
+                encode(COALESCE(et._from, modtx.module), 'hex') as executor_address,
+                erc721.timestamp as execution_date,
+                erc721.timestamp as executed_at,
+                COALESCE(mt.origin->> 'note', '') as note,
+                encode(erc721.ethereum_tx_id, 'hex') as transaction_hash,
+                encode(COALESCE(modtx.to, mt.to), 'hex') as contract_address,
+                -- Just get the nonces from the provided Safe
+                CASE WHEN mt.safe = %s THEN mt.nonce ELSE NULL END AS nonce,
+                -- Assigns a row number to each ERC721 transfer grouped by tx and log index.
+                -- Prioritizes module > multisig > standalone using execution time as tiebreaker.
+                ROW_NUMBER() OVER (
+                    PARTITION BY erc721.ethereum_tx_id, erc721.log_index
+                    ORDER BY
+                        CASE
+                            WHEN modtx.internal_tx_id IS NOT NULL THEN 1
+                            WHEN mt.safe IS NOT NULL  THEN 2
+                        ELSE 3
+                        END,
+                    COALESCE(mt.created, erc721.timestamp)
+                ) AS rn
+            FROM history_erc721transfer erc721
+            JOIN history_saferelevanttransaction rel ON rel.safe = %s AND rel.ethereum_tx_id = erc721.ethereum_tx_id
+            JOIN history_ethereumtx et ON rel.ethereum_tx_id = et.tx_hash
+            LEFT JOIN history_multisigtransaction mt ON erc721.ethereum_tx_id = mt.ethereum_tx_id
+            LEFT JOIN history_internaltx itx ON itx.ethereum_tx_id = erc721.ethereum_tx_id
+            LEFT JOIN history_moduletransaction modtx ON modtx.internal_tx_id = itx.id
+            LEFT JOIN tokens_token t ON erc721.address = t.address
+            WHERE (erc721.to = %s OR erc721._from = %s){erc721_timestamp_conditions}
+
+            UNION ALL
+
+            --Native transfers
+            SELECT
+                encode(%s, 'hex') as safe_address,
+                encode(itx._from, 'hex') as from_address,
+                encode(itx.to, 'hex') as to_address,
+                itx.value::text as amount,
+                'native' as asset_type,
+                null as asset_address,
+                'ETH' as asset_symbol,
+                18 as asset_decimals,
+                encode(mt.proposer, 'hex') as proposer_address,
+                mt.created as proposed_at,
+                encode(COALESCE(et._from, modtx.module), 'hex') as executor_address,
+                itx.timestamp as execution_date,
+                itx.timestamp as executed_at,
+                COALESCE(mt.origin->> 'note', '') as note,
+                encode(itx.ethereum_tx_id, 'hex') as transaction_hash,
+                encode(COALESCE(mt.to, modtx.to), 'hex') as contract_address,
+                -- Just get the nonces from the provided Safe
+                CASE WHEN mt.safe = %s THEN mt.nonce ELSE NULL END AS nonce,
+                -- Assigns a row number to each native transfer grouped by tx and log index.
+                -- Prioritizes module > multisig > standalone using execution time as tiebreaker.
+                ROW_NUMBER() OVER (
+                    PARTITION BY itx.ethereum_tx_id, itx.trace_address
+                    ORDER BY
+                        CASE
+                            WHEN modtx.internal_tx_id IS NOT NULL THEN 1
+                            WHEN mt.safe is NOT NULL THEN 2
+                            ELSE 3
+                        END,
+                    COALESCE(mt.created, itx.timestamp)
+                ) AS rn
+            FROM history_internaltx itx
+            JOIN history_saferelevanttransaction rel ON rel.safe = %s AND rel.ethereum_tx_id = itx.ethereum_tx_id
+            JOIN history_ethereumtx et ON rel.ethereum_tx_id = et.tx_hash
+            LEFT JOIN history_multisigtransaction mt ON itx.ethereum_tx_id = mt.ethereum_tx_id
+            LEFT JOIN history_moduletransaction modtx ON modtx.internal_tx_id = itx.id
+            WHERE(itx.to = %s OR itx._from = %s)
+            AND itx.call_type = 0
+            AND itx.value > 0{native_timestamp_conditions}
+        )
+        SELECT
+            safe_address,
+            from_address,
+            to_address,
+            amount,
+            asset_type,
+            asset_address,
+            asset_symbol,
+            asset_decimals,
+            proposer_address,
+            proposed_at,
+            executor_address,
+            execution_date,
+            executed_at,
+            note,
+            transaction_hash,
+            contract_address,
+            nonce
+        FROM export_data
+        WHERE rn = 1
+        ORDER BY execution_date DESC, transaction_hash
+        LIMIT %s OFFSET %s
+        """
+        # Parameters for main query (safe_address repeated for each UNION)
+        safe_address_bytes = HexBytes(safe_address)
+        main_params = [
+            safe_address_bytes
+        ] * 15 + [  # 15 instances of safe address in the query
+            limit,
+            offset,
+        ]
+
+        erc20_transfers = ERC20Transfer.objects.to_or_from(safe_address)
+        erc721_transfers = ERC721Transfer.objects.to_or_from(safe_address)
+        ether_transfers = InternalTx.objects.ether_txs_for_address(safe_address)
+
+        if execution_date_gte:
+            erc20_transfers = erc20_transfers.filter(timestamp__gte=execution_date_gte)
+            erc721_transfers = erc721_transfers.filter(
+                timestamp__gte=execution_date_gte
+            )
+            ether_transfers = ether_transfers.filter(timestamp__gte=execution_date_gte)
+        if execution_date_lte:
+            erc20_transfers = erc20_transfers.filter(timestamp__lte=execution_date_lte)
+            erc721_transfers = erc721_transfers.filter(
+                timestamp__lte=execution_date_lte
+            )
+            ether_transfers = ether_transfers.filter(timestamp__lte=execution_date_lte)
+
+        erc20_transfers = erc20_transfers.annotate(
+            transaction_hash=F("ethereum_tx_id"),
+            _log_index=F("log_index"),
+            _trace_address=RawSQL("NULL", ()),
+        ).values("transaction_hash", "_log_index", "_trace_address")
+        erc721_transfers = erc721_transfers.annotate(
+            transaction_hash=F("ethereum_tx_id"),
+            _log_index=F("log_index"),
+            _trace_address=RawSQL("NULL", ()),
+        ).values("transaction_hash", "_log_index", "_trace_address")
+        ether_transfers = ether_transfers.annotate(
+            transaction_hash=F("ethereum_tx_id"),
+            _log_index=RawSQL("NULL::numeric", ()),
+            _trace_address=F("trace_address"),
+        ).values("transaction_hash", "_log_index", "_trace_address")
+
+        total_count = (
+            ether_transfers.count() + erc20_transfers.count() + erc721_transfers.count()
+        )
+        with connection.cursor() as cursor:
+            # Get the data
+            cursor.execute(main_query, main_params)
+            columns = [col[0] for col in cursor.description]
+            results = []
+
+            for row in cursor.fetchall():
+                row_dict = dict(zip(columns, row, strict=False))
+
+                # Map to serializer field names
+                export_item = {
+                    "safe": fast_to_checksum_address(row_dict["safe_address"]),
+                    "_from": fast_to_checksum_address(row_dict["from_address"]),
+                    "to": fast_to_checksum_address(row_dict["to_address"]),
+                    "_value": row_dict["amount"],
+                    "asset_type": row_dict["asset_type"],
+                    "asset_address": (
+                        fast_to_checksum_address(row_dict["asset_address"])
+                        if row_dict["asset_address"]
+                        else None
+                    ),
+                    "asset_symbol": (
+                        row_dict["asset_symbol"] if row_dict["asset_symbol"] else None
+                    ),
+                    "asset_decimals": (
+                        row_dict["asset_decimals"]
+                        if row_dict["asset_decimals"]
+                        else None
+                    ),
+                    "proposer_address": (
+                        fast_to_checksum_address(row_dict["proposer_address"])
+                        if row_dict["proposer_address"]
+                        else None
+                    ),
+                    "proposed_at": (
+                        row_dict["proposed_at"] if row_dict["proposed_at"] else None
+                    ),
+                    "executor_address": (
+                        fast_to_checksum_address(row_dict["executor_address"])
+                        if row_dict["executor_address"]
+                        else None
+                    ),
+                    "executed_at": (
+                        row_dict["executed_at"] if row_dict["executed_at"] else None
+                    ),
+                    "note": row_dict["note"] if row_dict["note"] else None,
+                    "transaction_hash": "0x" + row_dict["transaction_hash"],
+                    "contract_address": (
+                        fast_to_checksum_address(row_dict["contract_address"])
+                        if row_dict["contract_address"]
+                        else None
+                    ),
+                    "nonce": row_dict["nonce"],
+                }
+                results.append(export_item)
+
+        logger.debug(
+            "[%s] Got %d export transactions from %d total using raw SQL",
+            safe_address,
+            len(results),
+            total_count,
+        )
+
+        return results, total_count

@@ -4,7 +4,8 @@ import json
 import logging
 import operator
 import random
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from collections.abc import Sequence
+from typing import Any
 from urllib.parse import urljoin
 
 from django.conf import settings
@@ -16,9 +17,8 @@ from cache_memoize import cache_memoize
 from cachetools import TTLCache, cachedmethod
 from eth_typing import ChecksumAddress
 from redis import Redis
-
-from gnosis.eth import EthereumClient, EthereumClientProvider
-from gnosis.eth.clients import EnsClient
+from safe_eth.eth import EthereumClient, EthereumNetwork, get_auto_ethereum_client
+from safe_eth.eth.clients import EnsClient
 
 from safe_transaction_service.tokens.constants import (
     CRYPTO_KITTIES_CONTRACT_ADDRESSES,
@@ -46,7 +46,7 @@ class MetadataRetrievalExceptionTimeout(CollectiblesServiceException):
     pass
 
 
-def ipfs_to_http(uri: Optional[str]) -> Optional[str]:
+def ipfs_to_http(uri: str | None) -> str | None:
     if uri and uri.startswith("ipfs://"):
         uri = uri.replace("ipfs://ipfs/", "ipfs://")
         return urljoin(
@@ -96,24 +96,24 @@ class CollectibleWithMetadata(Collectible):
     Collectible with metadata parsed if possible
     """
 
-    metadata: Dict[str, Any]
-    name: Optional[str] = dataclasses.field(init=False)
-    description: Optional[str] = dataclasses.field(init=False)
-    image_uri: Optional[str] = dataclasses.field(init=False)
+    metadata: dict[str, Any]
+    name: str | None = dataclasses.field(init=False)
+    description: str | None = dataclasses.field(init=False)
+    image_uri: str | None = dataclasses.field(init=False)
 
-    def get_name(self) -> Optional[str]:
+    def get_name(self) -> str | None:
         if self.metadata:
             for key in ("name",):
                 if key in self.metadata:
                     return self.metadata[key]
 
-    def get_description(self) -> Optional[str]:
+    def get_description(self) -> str | None:
         if self.metadata:
             for key in ("description",):
                 if key in self.metadata:
                     return self.metadata[key]
 
-    def get_metadata_image(self) -> Optional[str]:
+    def get_metadata_image(self) -> str | None:
         if not self.metadata:
             return None
 
@@ -138,7 +138,7 @@ class CollectibleWithMetadata(Collectible):
 class CollectiblesServiceProvider:
     def __new__(cls):
         if not hasattr(cls, "instance"):
-            cls.instance = CollectiblesService(EthereumClientProvider(), get_redis())
+            cls.instance = CollectiblesService(get_auto_ethereum_client(), get_redis())
 
         return cls.instance
 
@@ -161,17 +161,54 @@ class CollectiblesService:
         self.ethereum_client = ethereum_client
         self.ethereum_network = ethereum_client.get_network()
         self.redis = redis
-        self.ens_service: EnsClient = EnsClient(self.ethereum_network.value)
+
+        base_url = settings.ENS_SUBGRAPH_URL
+        api_key = settings.ENS_SUBGRAPH_API_KEY
+        subgraph_id = settings.ENS_SUBGRAPH_ID
+
+        # If the ENS subgraph is configured, always use it
+        if base_url and api_key and subgraph_id:
+            config = EnsClient.SubgraphConfig(
+                base_url=base_url,
+                api_key=api_key,
+                subgraph_id=subgraph_id,
+            )
+        # Else, provide fallback for Sepolia, Holesky or empty configuration.
+        else:
+            logger.warning(
+                "Using fallback EnsClient configuration. This configuration is not suitable for production and it is "
+                "recommended to setup a Subgraph API key. Mandatory for networks other than Sepolia or Holesky."
+                "See https://docs.ens.domains/web/subgraph"
+            )
+            config = self.fallback_ens_client()
+
+        self.ens_service: EnsClient = EnsClient(config=config)
 
         self.cache_token_info: TTLCache[ChecksumAddress, Erc721InfoWithLogo] = TTLCache(
             maxsize=4096, ttl=self.TOKEN_EXPIRATION
         )
         self.ens_image_url = settings.TOKENS_ENS_IMAGE_URL
 
+    def fallback_ens_client(self) -> EnsClient.Config:
+        if self.ethereum_network == EthereumNetwork.SEPOLIA:
+            return EnsClient.Config(
+                "https://api.studio.thegraph.com/query/49574/enssepolia/version/latest",
+            )
+        elif self.ethereum_network == EthereumNetwork.HOLESKY:
+            return EnsClient.Config(
+                "https://api.studio.thegraph.com/query/49574/ensholesky/version/latest",
+            )
+        else:
+            logger.warning(
+                "No fallback Ens Client configuration for network=%s available",
+                self.ethereum_network,
+            )
+            return EnsClient.Config("")
+
     def get_metadata_cache_key(self, address: str, token_id: int):
         return f"metadata:{address}:{token_id}"
 
-    def _decode_base64_uri(self, uri: str) -> Optional[Dict[str, Any]]:
+    def _decode_base64_uri(self, uri: str) -> dict[str, Any] | None:
         """
         Decodes data:application/json;base64 uris
 
@@ -241,15 +278,15 @@ class CollectiblesService:
                     )
 
                 return response.json()
-        except (IOError, ValueError) as e:
+        except (OSError, ValueError) as e:
             raise MetadataRetrievalExceptionTimeout(uri) from e
 
     def build_collectible(
         self,
-        token_info: Optional[Erc721InfoWithLogo],
+        token_info: Erc721InfoWithLogo | None,
         token_address: ChecksumAddress,
         token_id: int,
-        token_metadata_uri: Optional[str],
+        token_metadata_uri: str | None,
     ) -> Collectible:
         """
         Build a collectible from the input parameters
@@ -279,6 +316,9 @@ class CollectiblesService:
         Return metadata for a collectible
         :param collectible
         """
+        if not settings.COLLECTIBLES_ENABLE_DOWNLOAD_METADATA:
+            logger.warning("Downloading collectibles metadata is disabled")
+            return None
         if tld := ENS_CONTRACTS_WITH_TLD.get(
             collectible.address
         ):  # Special case for ENS
@@ -297,9 +337,9 @@ class CollectiblesService:
         safe_address: ChecksumAddress,
         only_trusted: bool = False,
         exclude_spam: bool = False,
-        limit: Optional[int] = None,
+        limit: int | None = None,
         offset: int = 0,
-    ) -> Tuple[List[Collectible], int]:
+    ) -> tuple[list[Collectible], int]:
         """
         :param safe_address:
         :param only_trusted: If True, return balance only for trusted tokens
@@ -316,7 +356,10 @@ class CollectiblesService:
             # No need for further DB/Cache calls
             return [], 0
 
-        cache_key = f"collectibles:{safe_address}:{only_trusted}:{exclude_spam}:{limit}{offset}:{number_erc721_events}"
+        cache_key = (
+            f"collectibles:{safe_address}:{only_trusted}:{exclude_spam}:{limit}:{offset}:"
+            f"{number_erc721_events}"
+        )
         cache_key_count = (
             f"collectibles_count:{safe_address}:{only_trusted}:{exclude_spam}"
         )
@@ -340,9 +383,9 @@ class CollectiblesService:
         safe_address: ChecksumAddress,
         only_trusted: bool = False,
         exclude_spam: bool = False,
-        limit: Optional[int] = None,
+        limit: int | None = None,
         offset: int = 0,
-    ) -> Tuple[List[Collectible], int]:
+    ) -> tuple[list[Collectible], int]:
         """
         :param safe_address:
         :param only_trusted: If True, return balance only for trusted tokens
@@ -375,7 +418,7 @@ class CollectiblesService:
         logger.debug("Got token_uris for %s", addresses_with_token_ids)
         collectibles = []
         for (token_address, token_id), token_uri in zip(
-            addresses_with_token_ids, token_uris
+            addresses_with_token_ids, token_uris, strict=False
         ):
             token_info = self.get_token_info(token_address)
             collectible = self.build_collectible(
@@ -390,9 +433,9 @@ class CollectiblesService:
         safe_address: ChecksumAddress,
         only_trusted: bool = False,
         exclude_spam: bool = False,
-        limit: Optional[int] = None,
+        limit: int | None = None,
         offset: int = 0,
-    ) -> Tuple[List[CollectibleWithMetadata], int]:
+    ) -> tuple[list[CollectibleWithMetadata], int]:
         """
         Get collectibles using the owner, addresses and the token_ids
 
@@ -407,7 +450,7 @@ class CollectiblesService:
         # Async retry for getting metadata if fetching fails
         from ..tasks import retry_get_metadata_task
 
-        collectibles_with_metadata: List[CollectibleWithMetadata] = []
+        collectibles_with_metadata: list[CollectibleWithMetadata] = []
         collectibles, count = self.get_collectibles(
             safe_address,
             only_trusted=only_trusted,
@@ -423,7 +466,7 @@ class CollectiblesService:
 
         collectibles_not_cached = []
         jobs = []
-        for cached, collectible in zip(cached_results, collectibles):
+        for cached, collectible in zip(cached_results, collectibles, strict=False):
             if cached:
                 collectible_cache = json.loads(cached)
                 collectibles_with_metadata.append(
@@ -445,7 +488,7 @@ class CollectiblesService:
         _ = gevent.joinall(jobs)
         collectibles_with_metadata_not_cached = []
         redis_pipe = self.redis.pipeline()
-        for collectible, job in zip(collectibles_not_cached, jobs):
+        for collectible, job in zip(collectibles_not_cached, jobs, strict=False):
             try:
                 metadata = job.get()
                 if not isinstance(metadata, dict):
@@ -465,7 +508,7 @@ class CollectiblesService:
             except MetadataRetrievalExceptionTimeout:
                 metadata = {}
                 logger.warning(
-                    "Timeout retrieving metadata on token-uri=%s for token-address=%s, retrying asyncronous ",
+                    "Timeout retrieving metadata on token-uri=%s for token-address=%s, retrying asynchronous ",
                     collectible.uri,
                     collectible.address,
                 )
@@ -507,7 +550,7 @@ class CollectiblesService:
         exclude_spam: bool = False,
         limit: int = 10,
         offset: int = 0,
-    ) -> Tuple[List[CollectibleWithMetadata], int]:
+    ) -> tuple[list[CollectibleWithMetadata], int]:
         """
         Get collectibles paginated
 
@@ -526,7 +569,7 @@ class CollectiblesService:
     @cache_memoize(TOKEN_EXPIRATION, prefix="collectibles-get_token_info")  # 1 hour
     def get_token_info(
         self, token_address: ChecksumAddress
-    ) -> Optional[Erc721InfoWithLogo]:
+    ) -> Erc721InfoWithLogo | None:
         """
         :param token_address:
         :return: Erc721 name and symbol. If it cannot be found, `name=''` and `symbol=''`
@@ -539,8 +582,8 @@ class CollectiblesService:
                 return Erc721InfoWithLogo.from_token(token)
 
     def get_token_uris(
-        self, addresses_with_token_ids: Sequence[Tuple[ChecksumAddress, int]]
-    ) -> List[Optional[str]]:
+        self, addresses_with_token_ids: Sequence[tuple[ChecksumAddress, int]]
+    ) -> list[str | None]:
         """
         Cache token_uris, as they shouldn't change
 
@@ -548,7 +591,7 @@ class CollectiblesService:
         :return: List of token_uris in the same other that `addresses_with_token_ids` were provided
         """
 
-        def get_redis_key(address_with_token_id: Tuple[ChecksumAddress, int]) -> str:
+        def get_redis_key(address_with_token_id: tuple[ChecksumAddress, int]) -> str:
             token_address, token_id = address_with_token_id
             return f"token-uri:{token_address}:{token_id}"
 
@@ -558,11 +601,11 @@ class CollectiblesService:
             for address_with_token_id in addresses_with_token_ids
         )
         # Redis does not allow `None`, so empty string is used for uris searched but not found
-        found_uris: Dict[Tuple[ChecksumAddress, int], Optional[str]] = {}
-        not_found_uris: List[Tuple[ChecksumAddress, int]] = []
+        found_uris: dict[tuple[ChecksumAddress, int], str | None] = {}
+        not_found_uris: list[tuple[ChecksumAddress, int]] = []
 
         for address_with_token_id, token_uri in zip(
-            addresses_with_token_ids, redis_token_uris
+            addresses_with_token_ids, redis_token_uris, strict=False
         ):
             if token_uri is None:
                 not_found_uris.append(address_with_token_id)
@@ -582,10 +625,11 @@ class CollectiblesService:
                 for address_with_token_id, token_uri in zip(
                     not_found_uris,
                     self.ethereum_client.erc721.get_token_uris(not_found_uris),
+                    strict=False,
                 )
             }
             logger.debug("Got token uris from blockchain")
-        except (IOError, ValueError):
+        except (OSError, ValueError):
             logger.warning(
                 "Problem when getting token uris from blockchain, trying individually",
                 exc_info=True,
@@ -606,7 +650,7 @@ class CollectiblesService:
                         not_found_uri,
                         exc_info=True,
                     )
-                except IOError as exc:
+                except OSError as exc:
                     raise NodeConnectionException from exc
 
         if blockchain_token_uris:

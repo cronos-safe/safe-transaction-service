@@ -1,7 +1,7 @@
 import json
 import logging
 from functools import cache
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from django.conf import settings
 
@@ -16,11 +16,11 @@ logger = logging.getLogger(__name__)
 class BrokerConnection:
     def __init__(self):
         self.exchange_name: str = settings.EVENTS_QUEUE_EXCHANGE_NAME
-        self.channel: Optional[Channel] = None
+        self.channel: Channel | None = None
         self.connection_parameters = URLParameters(settings.EVENTS_QUEUE_URL)
-        self.connection: Optional[BlockingConnection] = self.connect()
+        self.connection: BlockingConnection | None = self.connect()
 
-    def connect(self) -> Optional[BlockingConnection]:
+    def connect(self) -> BlockingConnection | None:
         """
         This method connects to RabbitMq using BlockingConnection.
 
@@ -43,13 +43,16 @@ class BrokerConnection:
             logger.error("Cannot open connection to RabbitMQ")
             return None
 
-    def publish(self, message: str, retry: Optional[bool] = True) -> bool:
+    def publish(self, message: str, retry: bool | None = True) -> bool:
         """
         :param message:
         :param retry:
         :return: `True` if message was published, `False` otherwise
         """
         try:
+            if not self.channel:
+                raise pika.exceptions.AMQPError("Channel is not available")
+
             self.channel.basic_publish(
                 exchange=self.exchange_name, routing_key="", body=message
             )
@@ -68,20 +71,20 @@ def get_queue_service():
     if settings.EVENTS_QUEUE_URL:
         return QueueService()
     else:
-        # Mock send_event to not configured host us is not mandatory configure a queue for events
+        # It's not mandatory to configure a queue, so send_event will be mocked
         logger.warning("MockedQueueService is used")
         return MockedQueueService()
 
 
 class QueueService:
     def __init__(self):
-        self._connection_pool: List[BrokerConnection] = []
+        self._connection_pool: list[BrokerConnection] = []
         self._total_connections: int = 0
-        self.unsent_events: List = []
+        self.unsent_events: list[str] = []
 
-    def get_connection(self) -> Optional[BrokerConnection]:
+    def get_connection(self) -> BrokerConnection | None:
         """
-        :return: A `BrokerConnection` from the connection pool if there is one available, othwerwise
+        :return: A `BrokerConnection` from the connection pool if there is one available, otherwise
             returns a new BrokerConnection
         """
         if (
@@ -99,10 +102,14 @@ class QueueService:
         else:
             broker_connection = BrokerConnection()
 
-        self._total_connections += 1
-        return broker_connection
+        if broker_connection.channel:
+            self._total_connections += 1
+            return broker_connection
 
-    def release_connection(self, broker_connection: Optional[BrokerConnection]):
+        logger.warning("RabbitMQ channel is not available")
+        return None
+
+    def release_connection(self, broker_connection: BrokerConnection | None):
         """
         Return the `BrokerConnection` to the pool
 
@@ -114,13 +121,13 @@ class QueueService:
         if broker_connection:
             self._connection_pool.insert(0, broker_connection)
 
-    def send_event(self, payload: Dict[str, Any]) -> int:
+    def send_event(self, payload: dict[str, Any]) -> int:
         """
         Publish event using the `BrokerConnection`
 
         :param payload: Number of events published
         """
-        event = json.dumps(payload)
+        event: str = json.dumps(payload)
         if not (broker_connection := self.get_connection()):
             # No available connections in the pool, store event to send it later
             self.unsent_events.append(event)
@@ -176,5 +183,5 @@ class MockedQueueService:
     Mocked class to use in case that there is not rabbitMq queue to send events
     """
 
-    def send_event(self, event: Dict[str, Any]):
+    def send_event(self, event: dict[str, Any]):
         logger.debug("MockedQueueService: Not sending event with payload %s", event)

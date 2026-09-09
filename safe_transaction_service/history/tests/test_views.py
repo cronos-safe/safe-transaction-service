@@ -1,10 +1,9 @@
 import datetime
 import json
 import logging
-import pickle
-from dataclasses import asdict
 from unittest import mock
-from unittest.mock import MagicMock, PropertyMock
+from unittest.mock import MagicMock
+from urllib.parse import urlencode
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
@@ -19,38 +18,44 @@ from requests import ReadTimeout
 from rest_framework import status
 from rest_framework.exceptions import ErrorDetail
 from rest_framework.test import APIRequestFactory, APITestCase, force_authenticate
+from safe_eth.eth.constants import NULL_ADDRESS
+from safe_eth.eth.ethereum_client import EthereumClient, TracingManager
+from safe_eth.eth.utils import fast_is_checksum_address, fast_keccak_text
+from safe_eth.safe import CannotEstimateGas, Safe, SafeOperationEnum
+from safe_eth.safe.safe_signature import SafeSignature, SafeSignatureType
+from safe_eth.safe.signatures import signature_to_bytes
+from safe_eth.safe.tests.safe_test_case import SafeTestCaseMixin
+from safe_eth.util.util import to_0x_hex_str
 
-from gnosis.eth.constants import NULL_ADDRESS
-from gnosis.eth.ethereum_client import EthereumClient, TracingManager
-from gnosis.eth.utils import fast_is_checksum_address, fast_keccak_text
-from gnosis.safe import CannotEstimateGas, Safe, SafeOperationEnum
-from gnosis.safe.safe_signature import SafeSignature, SafeSignatureType
-from gnosis.safe.signatures import signature_to_bytes
-from gnosis.safe.tests.safe_test_case import SafeTestCaseMixin
-
+from safe_transaction_service.account_abstraction.tests import factories as aa_factories
 from safe_transaction_service.contracts.models import ContractQuerySet
 from safe_transaction_service.contracts.tests.factories import ContractFactory
 from safe_transaction_service.contracts.tx_decoder import DbTxDecoder
 from safe_transaction_service.tokens.models import Token
 from safe_transaction_service.tokens.tests.factories import TokenFactory
+from safe_transaction_service.utils.utils import datetime_to_str
 
 from ...utils.redis import get_redis
 from ..helpers import DelegateSignatureHelper, DeleteMultisigTxSignatureHelper
 from ..models import (
     IndexingStatus,
+    InternalTx,
+    InternalTxType,
+    ModuleTransaction,
     MultisigConfirmation,
     MultisigTransaction,
     SafeContractDelegate,
     SafeMasterCopy,
 )
 from ..serializers import TransferType
-from ..services import BalanceService
-from ..services.balance_service import Erc20InfoWithLogo
-from ..views import SafeMultisigTransactionListView
+from ..views import (
+    SafeModuleTransactionListView,
+    SafeMultisigTransactionListView,
+    SafeTransferListView,
+)
 from .factories import (
     ERC20TransferFactory,
     ERC721TransferFactory,
-    EthereumBlockFactory,
     EthereumTxFactory,
     InternalTxFactory,
     ModuleTransactionFactory,
@@ -61,6 +66,13 @@ from .factories import (
     SafeLastStatusFactory,
     SafeMasterCopyFactory,
     SafeStatusFactory,
+)
+from .mocks.blocks import mocked_blocks
+from .mocks.deployments_mock import (
+    mainnet_deployments,
+    mainnet_deployments_1_4_1,
+    mainnet_deployments_1_4_1_multisend,
+    mainnet_deployments_1_4_1_safe,
 )
 from .mocks.mocks_safe_creation import (
     create_cpk_test_data,
@@ -90,7 +102,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
     def test_swagger_json_schema(self):
-        url = reverse("schema-json", args=(".json",))
+        url = reverse("schema-json") + "?format=json"
         response = self.client.get(url, format="json")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
@@ -116,11 +128,15 @@ class TestViews(SafeTestCaseMixin, APITestCase):
 
     @mock.patch.object(
         EthereumClient,
-        "current_block_number",
-        new_callable=PropertyMock,
-        return_value=2_000,
+        "get_block",
+        return_value=mocked_blocks[0],
     )
-    def test_indexing_view(self, current_block_number_mock: PropertyMock):
+    @mock.patch.object(
+        EthereumClient,
+        "get_blocks",
+        return_value=mocked_blocks[1:],
+    )
+    def test_indexing_view(self, mock_get_blocks: MagicMock, mock_get_block: MagicMock):
         IndexingStatus.objects.set_erc20_721_indexing_status(2_005)
         url = reverse("v1:history:indexing")
         response = self.client.get(url, format="json")
@@ -131,6 +147,14 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["master_copies_block_number"], 2_000)
         self.assertEqual(response.data["master_copies_synced"], True)
         self.assertEqual(response.data["synced"], True)
+        # Same block, so they should share the same timestamp
+        self.assertEqual(
+            response.data["current_block_timestamp"], "2024-06-03T18:29:23Z"
+        )
+        self.assertEqual(response.data["erc20_block_timestamp"], "2024-06-03T18:29:23Z")
+        self.assertEqual(
+            response.data["master_copies_block_timestamp"], "2024-06-03T18:29:23Z"
+        )
 
         IndexingStatus.objects.set_erc20_721_indexing_status(500)
         response = self.client.get(url, format="json")
@@ -141,6 +165,13 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["master_copies_block_number"], 2000)
         self.assertEqual(response.data["master_copies_synced"], True)
         self.assertEqual(response.data["synced"], False)
+        self.assertEqual(
+            response.data["current_block_timestamp"], "2024-06-03T18:29:23Z"
+        )
+        self.assertEqual(response.data["erc20_block_timestamp"], "2024-06-03T18:29:35Z")
+        self.assertEqual(
+            response.data["master_copies_block_timestamp"], "2024-06-03T18:29:47Z"
+        )
 
         safe_master_copy = SafeMasterCopyFactory(tx_block_number=2000)
         response = self.client.get(url, format="json")
@@ -151,6 +182,13 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["master_copies_block_number"], 1999)
         self.assertEqual(response.data["master_copies_synced"], True)
         self.assertEqual(response.data["synced"], False)
+        self.assertEqual(
+            response.data["current_block_timestamp"], "2024-06-03T18:29:23Z"
+        )
+        self.assertEqual(response.data["erc20_block_timestamp"], "2024-06-03T18:29:35Z")
+        self.assertEqual(
+            response.data["master_copies_block_timestamp"], "2024-06-03T18:29:47Z"
+        )
 
         safe_master_copy.tx_block_number = 600
         safe_master_copy.save(update_fields=["tx_block_number"])
@@ -161,6 +199,13 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["master_copies_block_number"], 599)
         self.assertEqual(response.data["master_copies_synced"], False)
         self.assertEqual(response.data["synced"], False)
+        self.assertEqual(
+            response.data["current_block_timestamp"], "2024-06-03T18:29:23Z"
+        )
+        self.assertEqual(response.data["erc20_block_timestamp"], "2024-06-03T18:29:35Z")
+        self.assertEqual(
+            response.data["master_copies_block_timestamp"], "2024-06-03T18:29:47Z"
+        )
 
         IndexingStatus.objects.set_erc20_721_indexing_status(10)
         SafeMasterCopyFactory(tx_block_number=8)
@@ -172,6 +217,13 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["master_copies_block_number"], 7)
         self.assertEqual(response.data["master_copies_synced"], False)
         self.assertEqual(response.data["synced"], False)
+        self.assertEqual(
+            response.data["current_block_timestamp"], "2024-06-03T18:29:23Z"
+        )
+        self.assertEqual(response.data["erc20_block_timestamp"], "2024-06-03T18:29:35Z")
+        self.assertEqual(
+            response.data["master_copies_block_timestamp"], "2024-06-03T18:29:47Z"
+        )
 
         SafeMasterCopyFactory(tx_block_number=11)
         response = self.client.get(url, format="json")
@@ -182,6 +234,13 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["master_copies_block_number"], 7)
         self.assertEqual(response.data["master_copies_synced"], False)
         self.assertEqual(response.data["synced"], False)
+        self.assertEqual(
+            response.data["current_block_timestamp"], "2024-06-03T18:29:23Z"
+        )
+        self.assertEqual(response.data["erc20_block_timestamp"], "2024-06-03T18:29:35Z")
+        self.assertEqual(
+            response.data["master_copies_block_timestamp"], "2024-06-03T18:29:47Z"
+        )
 
         IndexingStatus.objects.set_erc20_721_indexing_status(2_000)
         SafeMasterCopy.objects.update(tx_block_number=2_000)
@@ -193,6 +252,13 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["master_copies_block_number"], 1999)
         self.assertEqual(response.data["master_copies_synced"], True)
         self.assertEqual(response.data["synced"], True)
+        self.assertEqual(
+            response.data["current_block_timestamp"], "2024-06-03T18:29:23Z"
+        )
+        self.assertEqual(response.data["erc20_block_timestamp"], "2024-06-03T18:29:35Z")
+        self.assertEqual(
+            response.data["master_copies_block_timestamp"], "2024-06-03T18:29:47Z"
+        )
 
         SafeMasterCopyFactory(tx_block_number=48)
         response = self.client.get(url, format="json")
@@ -203,6 +269,51 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["master_copies_block_number"], 47)
         self.assertEqual(response.data["master_copies_synced"], False)
         self.assertEqual(response.data["synced"], False)
+        self.assertEqual(
+            response.data["current_block_timestamp"], "2024-06-03T18:29:23Z"
+        )
+        self.assertEqual(response.data["erc20_block_timestamp"], "2024-06-03T18:29:35Z")
+        self.assertEqual(
+            response.data["master_copies_block_timestamp"], "2024-06-03T18:29:47Z"
+        )
+
+    # Mock chain id to mainnet
+    @mock.patch("safe_transaction_service.history.views.get_chain_id", return_value=1)
+    def test_safe_deployments_view(self, get_chain_id_mock):
+        url = reverse("v1:history:deployments")
+        response = self.client.get(url, format="json")
+        self.maxDiff = None
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json(), mainnet_deployments)
+
+        response = self.client.get(url + "?version=5.0.0", format="json")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+        response = self.client.get(url + "?version=1.4.1", format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json(), [mainnet_deployments_1_4_1])
+
+        response = self.client.get(
+            url + "?version=1.4.1&contract=MultiSend", format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.json(),
+            [{"version": "1.4.1", "contracts": [mainnet_deployments_1_4_1_multisend]}],
+        )
+
+        response = self.client.get(url + "?contract=Safe", format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.json(),
+            [
+                {"version": "1.0.0", "contracts": []},
+                {"version": "1.1.1", "contracts": []},
+                {"version": "1.2.0", "contracts": []},
+                {"version": "1.3.0", "contracts": []},
+                {"version": "1.4.1", "contracts": [mainnet_deployments_1_4_1_safe]},
+            ],
+        )
 
     def test_all_transactions_view(self):
         safe_address = Account.create().address
@@ -217,49 +328,19 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         # in the reverse order that they were created
         multisig_transaction = MultisigTransactionFactory(safe=safe_address)
         module_transaction = ModuleTransactionFactory(safe=safe_address)
-        internal_tx_in = InternalTxFactory(to=safe_address, value=4)
-        internal_tx_out = InternalTxFactory(
-            _from=safe_address, value=5
-        )  # Should not appear
-        erc20_transfer_in = ERC20TransferFactory(to=safe_address)
+        InternalTxFactory(to=safe_address, value=4)
+        InternalTxFactory(_from=safe_address, value=5)  # Should not appear
+        ERC20TransferFactory(to=safe_address)
         erc20_transfer_out = ERC20TransferFactory(_from=safe_address)
-        another_multisig_transaction = MultisigTransactionFactory(safe=safe_address)
-        another_safe_multisig_transaction = (
-            MultisigTransactionFactory()
-        )  # Should not appear, it's for another Safe
+        MultisigTransactionFactory(safe=safe_address)
+        (MultisigTransactionFactory())  # Should not appear, it's for another Safe
 
-        # Should not appear unless queued=True, nonce > last mined transaction
-        higher_nonce_safe_multisig_transaction = MultisigTransactionFactory(
-            safe=safe_address, ethereum_tx=None
-        )
-        higher_nonce_safe_multisig_transaction_2 = MultisigTransactionFactory(
-            safe=safe_address, ethereum_tx=None
-        )
+        # Should not appear as they are not executed
+        for _ in range(2):
+            MultisigTransactionFactory(safe=safe_address, ethereum_tx=None)
 
         response = self.client.get(
             reverse("v1:history:all-transactions", args=(safe_address,))
-            + "?queued=False&trusted=True"
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data["count"], 4)
-
-        response = self.client.get(
-            reverse("v1:history:all-transactions", args=(safe_address,))
-            + "?queued=True&trusted=True"
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data["count"], 4)
-
-        response = self.client.get(
-            reverse("v1:history:all-transactions", args=(safe_address,))
-            + "?queued=True&trusted=False"
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data["count"], 8)
-
-        response = self.client.get(
-            reverse("v1:history:all-transactions", args=(safe_address,))
-            + "?queued=False&trusted=False"
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["count"], 6)
@@ -273,23 +354,23 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             False,  # Multisig transaction
         ]
         for transfer_not_empty, transaction in zip(
-            transfers_not_empty, response.data["results"]
+            transfers_not_empty, response.data["results"], strict=False
         ):
             self.assertEqual(bool(transaction["transfers"]), transfer_not_empty)
             self.assertTrue(transaction["tx_type"])
 
         # Test pagination
         response = self.client.get(
-            reverse("v1:history:all-transactions", args=(safe_address,))
-            + "?limit=3&queued=False&trusted=False"
+            reverse("v1:history:all-transactions", args=(safe_address,)) + "?limit=3"
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["count"], 6)
         self.assertEqual(len(response.data["results"]), 3)
+        self.assertIsInstance(response.data["results"][0]["nonce"], int)
 
         response = self.client.get(
             reverse("v1:history:all-transactions", args=(safe_address,))
-            + "?limit=4&offset=4&queued=False&trusted=False"
+            + "?limit=4&offset=4"
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["count"], 6)
@@ -301,12 +382,11 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         )
         # Add token info for that transfer
         token = TokenFactory(address=erc20_transfer_out.address)
-        internal_tx_in = InternalTxFactory(
+        InternalTxFactory(
             to=safe_address, value=8, ethereum_tx=multisig_transaction.ethereum_tx
         )
         response = self.client.get(
             reverse("v1:history:all-transactions", args=(safe_address,))
-            + "?queued=False&trusted=False"
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["count"], 6)
@@ -332,7 +412,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             True,  # Multisig transaction
         ]
         for transfer_not_empty, transaction in zip(
-            transfers_not_empty, response.data["results"]
+            transfers_not_empty, response.data["results"], strict=False
         ):
             self.assertEqual(bool(transaction["transfers"]), transfer_not_empty)
 
@@ -342,145 +422,56 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         # No mined
         MultisigTransactionFactory(safe=safe_address, ethereum_tx=None)
         MultisigTransactionFactory(safe=safe_address, ethereum_tx=None)
-        # Mine tx with higher nonce, all should appear
+        # Mined
         MultisigTransactionFactory(safe=safe_address)
 
         response = self.client.get(
             reverse("v1:history:all-transactions", args=(safe_address,))
-            + "?executed=False&queued=True&trusted=False"
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data["count"], 3)
-
-        response = self.client.get(
-            reverse("v1:history:all-transactions", args=(safe_address,))
-            + "?executed=True&queued=True&trusted=False"
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["count"], 1)
 
     def test_all_transactions_ordering(self):
         safe_address = Account.create().address
-        block_2_days_ago = EthereumBlockFactory(
-            timestamp=timezone.now() - datetime.timedelta(days=2)
-        )
-        ethereum_tx_2_days_ago = EthereumTxFactory(block=block_2_days_ago)
+
         # Older transaction
-        MultisigTransactionFactory(
-            safe=safe_address, ethereum_tx=ethereum_tx_2_days_ago
-        )
-        # Earlier transactions
-        MultisigTransactionFactory(safe=safe_address)
-        MultisigTransactionFactory(safe=safe_address)
+        erc20_transfer = ERC20TransferFactory(to=safe_address)
+        # Newer transaction
+        multisig_transaction = MultisigTransactionFactory(safe=safe_address)
+
         # Nonce is not allowed as a sorting parameter
         response = self.client.get(
             reverse("v1:history:all-transactions", args=(safe_address,))
             + "?ordering=nonce"
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        response = self.client.get(
-            reverse("v1:history:all-transactions", args=(safe_address,))
-            + "?trusted=False&ordering=execution_date"
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data["count"], 3)
-        first_result = response.data["results"][0]
-        self.assertEqual(
-            first_result["transaction_hash"], ethereum_tx_2_days_ago.tx_hash
-        )
-        response = self.client.get(
-            reverse("v1:history:all-transactions", args=(safe_address,))
-            + "?trusted=False&ordering=-execution_date"
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data["count"], 3)
-        last_result = response.data["results"][2]
-        self.assertEqual(
-            last_result["transaction_hash"], ethereum_tx_2_days_ago.tx_hash
-        )
 
-    def test_all_transactions_cache_view(self):
-        safe_address = "0x54f3c8e4Bf7bFDFF39B36d1FAE4e5ceBdD93C6A9"
-        # Older transaction
-        factory_transactions = [
-            MultisigTransactionFactory(safe=safe_address),
-            MultisigTransactionFactory(safe=safe_address),
-        ]
-        # all-txs:{safe}:{executed}{queued}{trusted}:{limit}:{offset}:{ordering}:{relevant_elements}
-        cache_key = "all-txs:0x54f3c8e4Bf7bFDFF39B36d1FAE4e5ceBdD93C6A9:100:10:0:execution_date:2"
-        redis = get_redis()
-        redis.delete(cache_key)
-        cache_result = redis.get(cache_key)
-        # Should be empty at the beginning
-        self.assertIsNone(cache_result)
-
+        # By default, newer transactions first
         response = self.client.get(
             reverse("v1:history:all-transactions", args=(safe_address,))
-            + "?executed=True&queued=False&trusted=False&ordering=execution_date"
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["count"], 2)
-
-        cache_result = redis.get(cache_key)
-        # Should be stored in redis cache
-        self.assertIsNotNone(cache_result)
-        # Cache should content the expected values
-        cache_values, cache_count = pickle.loads(cache_result)
-        self.assertEqual(cache_count, 2)
-        for cache_value, factory_transaction in zip(cache_values, factory_transactions):
-            self.assertEqual(
-                cache_value["safe_tx_hash"], factory_transaction.safe_tx_hash
-            )
-            self.assertEqual(cache_value["created"], factory_transaction.created)
-            self.assertEqual(
-                cache_value["execution_date"], factory_transaction.execution_date
-            )
-            self.assertEqual(
-                cache_value["block"], factory_transaction.ethereum_tx.block_id
-            )
-            self.assertEqual(cache_value["safe_nonce"], factory_transaction.nonce)
-        # Modify cache to empty list
-        redis.set(cache_key, pickle.dumps(([], 0)), ex=60 * 10)
+        self.assertEqual(
+            response.data["results"][0]["transaction_hash"],
+            multisig_transaction.ethereum_tx_id,
+        )
+        self.assertEqual(
+            response.data["results"][1]["tx_hash"], erc20_transfer.ethereum_tx_id
+        )
         response = self.client.get(
             reverse("v1:history:all-transactions", args=(safe_address,))
-            + "?executed=True&queued=False&trusted=False&ordering=execution_date"
+            + "?ordering=timestamp"
         )
-        # Response should be returned from cache
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data["count"], 0)
-
-        # Cache should be invalidated because there is new transaction
-        MultisigTransactionFactory(safe=safe_address)
-        response = self.client.get(
-            reverse("v1:history:all-transactions", args=(safe_address,))
-            + "?executed=True&queued=False&trusted=False&ordering=execution_date"
+        self.assertEqual(response.data["count"], 2)
+        self.assertEqual(
+            response.data["results"][0]["tx_hash"], erc20_transfer.ethereum_tx_id
         )
-        self.assertEqual(response.data["count"], 3)
-
-    def test_all_transactions_cache_limit_offset_view(self):
-        """
-        Test limit and offset
-        """
-        safe_address = "0x54f3c8e4Bf7bFDFF39B36d1FAE4e5ceBdD93C6A9"
-        number_transactions = 100
-
-        for _ in range(number_transactions):
-            MultisigTransactionFactory(safe=safe_address)
-
-        for limit, offset in ((57, 12), (13, 24)):
-            with self.subTest(limit=limit, offset=offset):
-                # all-txs:{safe}:{executed}{queued}{trusted}:{limit}:{offset}:{ordering}:{relevant_elements}
-                cache_key = f"all-txs:0x54f3c8e4Bf7bFDFF39B36d1FAE4e5ceBdD93C6A9:100:{limit}:{offset}:execution_date:{number_transactions}"
-                redis = get_redis()
-                self.assertFalse(redis.exists(cache_key))
-
-                response = self.client.get(
-                    reverse("v1:history:all-transactions", args=(safe_address,))
-                    + f"?executed=True&queued=False&trusted=False&ordering=execution_date&limit={limit}&offset={offset}"
-                )
-                self.assertEqual(response.data["count"], number_transactions)
-                self.assertEqual(len(response.data["results"]), limit)
-                self.assertTrue(redis.exists(cache_key))
+        self.assertEqual(
+            response.data["results"][1]["transaction_hash"],
+            multisig_transaction.ethereum_tx_id,
+        )
 
     def test_all_transactions_wrong_transfer_type_view(self):
         # No token in database, so we must trust the event
@@ -548,6 +539,36 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertIsNone(response.data["results"][0]["transfers"][0]["token_id"])
         self.assertEqual(response.data["results"][0]["transfers"][0]["value"], "0")
 
+    def test_all_transactions_duplicated_multisig_tx_view(self):
+        """
+        Test 2 module transactions with the same tx_hash
+        """
+        safe_address = Account.create().address
+        multisig_transaction_1 = MultisigTransactionFactory(safe=safe_address)
+        multisig_transaction_2 = MultisigTransactionFactory(
+            safe=safe_address,
+            ethereum_tx=multisig_transaction_1.ethereum_tx,
+        )
+
+        self.assertEqual(
+            multisig_transaction_1.ethereum_tx,
+            multisig_transaction_2.ethereum_tx,
+        )
+
+        response = self.client.get(
+            reverse("v1:history:all-transactions", args=(safe_address,))
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data["results"]), 2)
+        # We are aware of this. Pagination is done by `tx_hash`, so 2 transactions
+        # with the same `tx_hash` will return a `count` of 1
+        self.assertEqual(response.data["count"], 1)
+        # Even if they have the same `tx_hash`, tx with higher nonce will come first
+        self.assertEqual(
+            [multisig_transaction_2.safe_tx_hash, multisig_transaction_1.safe_tx_hash],
+            [multisig_tx["safe_tx_hash"] for multisig_tx in response.data["results"]],
+        )
+
     def test_all_transactions_duplicated_module_view(self):
         """
         Test 2 module transactions with the same tx_hash
@@ -566,10 +587,12 @@ class TestViews(SafeTestCaseMixin, APITestCase):
 
         response = self.client.get(
             reverse("v1:history:all-transactions", args=(safe_address,))
-            + "?queued=False&trusted=True"
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(response.data["results"]), response.data["count"], 2)
+        self.assertEqual(len(response.data["results"]), 2)
+        # We are aware of this. Pagination is done by `tx_hash`, so 2 transactions
+        # with the same `tx_hash` will return a `count` of 1
+        self.assertEqual(response.data["count"], 1)
         self.assertEqual(
             {module_transaction_1.module, module_transaction_2.module},
             {module_tx["module"] for module_tx in response.data["results"]},
@@ -625,6 +648,19 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["count"], 1)
 
+        # Test that the result should be cached
+        # Mock get_queryset with empty queryset return value to get proper error in case of fail
+        with mock.patch.object(
+            SafeModuleTransactionListView,
+            "get_queryset",
+            return_value=ModuleTransaction.objects.none(),
+        ) as patched_queryset:
+            response = self.client.get(url, format="json")
+            # queryset shouldn't be called
+            patched_queryset.assert_not_called()
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(response.data["count"], 1)
+
     def test_get_module_transaction(self):
         wrong_module_transaction_id = "wrong_module_transaction_id"
         url = reverse(
@@ -662,11 +698,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(
             response.json(),
             {
-                "created": module_transaction.created.isoformat().replace(
-                    "+00:00", "Z"
-                ),
-                "executionDate": module_transaction.internal_tx.ethereum_tx.block.timestamp.isoformat().replace(
-                    "+00:00", "Z"
+                "created": datetime_to_str(module_transaction.created),
+                "executionDate": datetime_to_str(
+                    module_transaction.internal_tx.ethereum_tx.block.timestamp
                 ),
                 "blockNumber": module_transaction.internal_tx.ethereum_tx.block_id,
                 "isSuccessful": not module_transaction.failed,
@@ -675,7 +709,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                 "module": module_transaction.module,
                 "to": module_transaction.to,
                 "value": str(module_transaction.value),
-                "data": module_transaction.data.hex(),
+                "data": to_0x_hex_str(module_transaction.data),
                 "operation": module_transaction.operation,
                 "dataDecoded": None,
                 "moduleTransactionId": module_transaction_id,
@@ -683,7 +717,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         )
 
     def test_get_multisig_confirmation(self):
-        random_safe_tx_hash = fast_keccak_text("enxebre").hex()
+        random_safe_tx_hash = to_0x_hex_str(fast_keccak_text("enxebre"))
         response = self.client.get(
             reverse(
                 "v1:history:multisig-transaction-confirmations",
@@ -709,11 +743,11 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["count"], 2)
 
     def test_post_multisig_confirmation(self):
-        random_safe_tx_hash = fast_keccak_text("enxebre").hex()
+        random_safe_tx_hash = to_0x_hex_str(fast_keccak_text("enxebre"))
         data = {
-            "signature": Account.create()
-            .signHash(random_safe_tx_hash)["signature"]
-            .hex()  # Not valid signature
+            "signature": to_0x_hex_str(
+                Account.create().unsafe_sign_hash(random_safe_tx_hash)["signature"]
+            )  # Not valid signature
         }
         response = self.client.post(
             reverse(
@@ -747,9 +781,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
 
         random_account = Account.create()
         data = {
-            "signature": random_account.signHash(safe_tx_hash)[
-                "signature"
-            ].hex()  # Not valid signature
+            "signature": to_0x_hex_str(
+                random_account.unsafe_sign_hash(safe_tx_hash)["signature"]
+            )  # Not valid signature
         }
         # Transaction was executed, confirmations cannot be added
         response = self.client.post(
@@ -781,7 +815,11 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             response.data["signature"][0],
         )
 
-        data = {"signature": owner_account_1.signHash(safe_tx_hash)["signature"].hex()}
+        data = {
+            "signature": to_0x_hex_str(
+                owner_account_1.unsafe_sign_hash(safe_tx_hash)["signature"]
+            )
+        }
         self.assertEqual(MultisigConfirmation.objects.count(), 0)
         response = self.client.post(
             reverse(
@@ -801,10 +839,10 @@ class TestViews(SafeTestCaseMixin, APITestCase):
 
         # Add multiple signatures
         data = {
-            "signature": (
-                owner_account_1.signHash(safe_tx_hash)["signature"]
-                + owner_account_2.signHash(safe_tx_hash)["signature"]
-            ).hex()
+            "signature": to_0x_hex_str(
+                owner_account_1.unsafe_sign_hash(safe_tx_hash)["signature"]
+                + owner_account_2.unsafe_sign_hash(safe_tx_hash)["signature"]
+            )
         }
         self.assertEqual(MultisigConfirmation.objects.count(), 1)
         response = self.client.post(
@@ -817,8 +855,47 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(MultisigConfirmation.objects.count(), 2)
 
+    def test_post_multisig_confirmation_banned(self):
+        owner_account_1 = Account.create()
+        owner_account_2 = Account.create()
+        safe = self.deploy_test_safe(
+            owners=[owner_account_1.address, owner_account_2.address]
+        )
+        safe_address = safe.address
+        multisig_transaction = MultisigTransactionFactory(
+            safe=safe_address, trusted=True, ethereum_tx=None
+        )
+        safe_tx_hash = multisig_transaction.safe_tx_hash
+        data = {
+            "signature": to_0x_hex_str(
+                owner_account_1.unsafe_sign_hash(safe_tx_hash)["signature"]
+            )
+        }
+        self.assertEqual(MultisigConfirmation.objects.count(), 0)
+        with self.settings(BANNED_EOAS={owner_account_1.address}):
+            response = self.client.post(
+                reverse(
+                    "v1:history:multisig-transaction-confirmations",
+                    args=(safe_tx_hash,),
+                ),
+                format="json",
+                data=data,
+            )
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertEqual(
+                response.json(),
+                {
+                    "signature": [
+                        f"Signer={owner_account_1.address} is not authorized to interact with the service"
+                    ]
+                },
+            )
+            self.assertEqual(MultisigConfirmation.objects.count(), 0)
+
     def test_get_multisig_transaction(self):
-        safe_tx_hash = fast_keccak_text("gnosis").hex()
+        safe = self.deploy_test_safe()
+        safe_address = safe.address
+        safe_tx_hash = to_0x_hex_str(fast_keccak_text("gnosis"))
         response = self.client.get(
             reverse("v1:history:multisig-transaction", args=(safe_tx_hash,)),
             format="json",
@@ -831,7 +908,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             "0000000001"
         )
 
-        multisig_tx = MultisigTransactionFactory(data=add_owner_with_threshold_data)
+        multisig_tx = MultisigTransactionFactory(
+            safe=safe_address, data=add_owner_with_threshold_data
+        )
         safe_tx_hash = multisig_tx.safe_tx_hash
         response = self.client.get(
             reverse("v1:history:multisig-transaction", args=(safe_tx_hash,)),
@@ -848,6 +927,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertIsNone(response.data["max_fee_per_gas"])
         self.assertIsNone(response.data["max_priority_fee_per_gas"])
         self.assertIsNone(response.data["proposer"])
+        self.assertIsNone(response.data["proposed_by_delegate"])
+        self.assertIsInstance(response.data["nonce"], int)
+
         self.assertEqual(
             response.data["data_decoded"],
             {
@@ -856,7 +938,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                     {
                         "name": "owner",
                         "type": "address",
-                        "value": "0x1b9a0DA11a5caCE4e703599" "3Cbb2E4B1B3b164Cf",
+                        "value": "0x1b9a0DA11a5caCE4e7035993Cbb2E4B1B3b164Cf",
                     },
                     {"name": "_threshold", "type": "uint256", "value": "1"},
                 ],
@@ -900,16 +982,30 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         )
         self.assertEqual(response.data["proposer"], proposer)
 
+        # Check proposed_by_delegate
+        delegate = Account.create().address
+        multisig_tx.proposed_by_delegate = delegate
+        multisig_tx.save()
+        response = self.client.get(
+            reverse("v1:history:multisig-transaction", args=(safe_tx_hash,)),
+            format="json",
+        )
+        self.assertEqual(response.data["proposer"], proposer)
+        self.assertEqual(response.data["proposed_by_delegate"], delegate)
+
     def test_delete_multisig_transaction(self):
         owner_account = Account.create()
-        safe_tx_hash = fast_keccak_text("random-tx").hex()
+        safe_tx_hash = to_0x_hex_str(fast_keccak_text("random-tx"))
         url = reverse("v1:history:multisig-transaction", args=(safe_tx_hash,))
         data = {"signature": "0x" + "1" * (130 * 2)}  # 2 signatures of 65 bytes
         response = self.client.delete(url, format="json", data=data)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
         # Add our test MultisigTransaction to the database
-        multisig_transaction = MultisigTransactionFactory(safe_tx_hash=safe_tx_hash)
+        safe = SafeContractFactory()
+        multisig_transaction = MultisigTransactionFactory(
+            safe_tx_hash=safe_tx_hash, safe=safe.address
+        )
 
         # Add other MultisigTransactions to the database to make sure they are not deleted
         MultisigTransactionFactory()
@@ -981,9 +1077,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         multisig_transaction.proposer = owner_account.address
         multisig_transaction.save(update_fields=["proposer"])
         data = {
-            "signature": owner_account.signHash(safe_tx_hash)[
-                "signature"
-            ].hex()  # Random signature
+            "signature": to_0x_hex_str(
+                owner_account.unsafe_sign_hash(safe_tx_hash)["signature"]
+            )  # Random signature
         }
         response = self.client.delete(url, format="json", data=data)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
@@ -992,24 +1088,110 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             {
                 "non_field_errors": [
                     ErrorDetail(
-                        string="Provided owner is not the proposer of the transaction",
+                        string="Provided signer is not the proposer or the delegate user who proposed the transaction",
                         code="invalid",
                     )
                 ]
             },
         )
 
-        # Use a proper signature
+        # Calculate a valid message_hash
         message_hash = DeleteMultisigTxSignatureHelper.calculate_hash(
-            multisig_transaction.safe,
+            safe.address,
             safe_tx_hash,
             self.ethereum_client.get_chain_id(),
             previous_totp=False,
         )
+
+        # Use an expired user delegate
+        safe_delegate = Account.create()
+        safe_contract_delegate = SafeContractDelegateFactory(
+            safe_contract_id=multisig_transaction.safe,
+            delegate=safe_delegate.address,
+            delegator=owner_account.address,
+            expiry_date=timezone.now() - datetime.timedelta(minutes=1),
+        )
+        multisig_transaction.proposer = owner_account.address
+        multisig_transaction.proposed_by_delegate = safe_delegate.address
+        multisig_transaction.save(update_fields=["proposer", "proposed_by_delegate"])
         data = {
-            "signature": owner_account.signHash(message_hash)[
-                "signature"
-            ].hex()  # Random signature
+            "signature": to_0x_hex_str(
+                safe_delegate.unsafe_sign_hash(message_hash)["signature"]
+            )
+        }
+        response = self.client.delete(url, format="json", data=data)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertDictEqual(
+            response.data,
+            {
+                "non_field_errors": [
+                    ErrorDetail(
+                        string="Provided signer is not the proposer or the delegate user who proposed the transaction",
+                        code="invalid",
+                    )
+                ]
+            },
+        )
+
+        # Use a deleted user delegate
+        safe_contract_delegate.delete()
+        multisig_transaction.proposer = owner_account.address
+        multisig_transaction.proposed_by_delegate = safe_delegate.address
+        multisig_transaction.save(update_fields=["proposer", "proposed_by_delegate"])
+        data = {
+            "signature": to_0x_hex_str(
+                safe_delegate.unsafe_sign_hash(message_hash)["signature"]
+            )
+        }
+        response = self.client.delete(url, format="json", data=data)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertDictEqual(
+            response.data,
+            {
+                "non_field_errors": [
+                    ErrorDetail(
+                        string="Provided signer is not the proposer or the delegate user who proposed the transaction",
+                        code="invalid",
+                    )
+                ]
+            },
+        )
+
+        # Use a proper signature of an user delegate
+        SafeContractDelegateFactory(
+            safe_contract_id=multisig_transaction.safe,
+            delegate=safe_delegate.address,
+            delegator=owner_account.address,
+        )
+        multisig_transaction.proposer = owner_account.address
+        multisig_transaction.proposed_by_delegate = safe_delegate.address
+        multisig_transaction.save(update_fields=["proposer", "proposed_by_delegate"])
+        data = {
+            "signature": to_0x_hex_str(
+                safe_delegate.unsafe_sign_hash(message_hash)["signature"]
+            )
+        }
+        self.assertEqual(MultisigTransaction.objects.count(), 3)
+        self.assertTrue(
+            MultisigTransaction.objects.filter(safe_tx_hash=safe_tx_hash).exists()
+        )
+        response = self.client.delete(url, format="json", data=data)
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertEqual(MultisigTransaction.objects.count(), 2)
+        self.assertFalse(
+            MultisigTransaction.objects.filter(safe_tx_hash=safe_tx_hash).exists()
+        )
+
+        # Use a proper signature of a proposer user
+        multisig_transaction = MultisigTransactionFactory(
+            safe_tx_hash=safe_tx_hash, safe=safe.address, ethereum_tx=None
+        )
+        multisig_transaction.proposer = owner_account.address
+        multisig_transaction.save(update_fields=["proposer"])
+        data = {
+            "signature": to_0x_hex_str(
+                owner_account.unsafe_sign_hash(message_hash)["signature"]
+            )
         }
         self.assertEqual(MultisigTransaction.objects.count(), 3)
         self.assertTrue(
@@ -1027,8 +1209,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
     def test_get_multisig_transactions(self):
-        safe_address = Account.create().address
-        proposer = Account.create().address
+        safe = self.deploy_test_safe()
+        safe_address = safe.address
+        proposer = safe.retrieve_owners()[0]
         response = self.client.get(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
             format="json",
@@ -1058,6 +1241,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             response.data["results"][0]["transaction_hash"],
             multisig_tx.ethereum_tx.tx_hash,
         )
+        self.assertIsInstance(response.data["results"][0]["nonce"], int)
         # Test camelCase
         self.assertEqual(
             response.json()["results"][0]["transactionHash"],
@@ -1074,6 +1258,20 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(len(response.data["results"]), 1)
         self.assertEqual(len(response.data["results"][0]["confirmations"]), 1)
         self.assertEqual(response.data["results"][0]["proposer"], proposer)
+        self.assertIsNone(response.data["results"][0]["proposed_by_delegate"])
+
+        # Check proposed_by_delegate
+        delegate = Account.create().address
+        multisig_tx.proposed_by_delegate = delegate
+        multisig_tx.save()
+        response = self.client.get(
+            reverse("v1:history:multisig-transactions", args=(safe_address,)),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data["results"]), 1)
+        self.assertEqual(response.data["results"][0]["proposer"], proposer)
+        self.assertEqual(response.data["results"][0]["proposed_by_delegate"], delegate)
 
         # Check not trusted
         response = self.client.get(
@@ -1095,12 +1293,30 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["count"], 2)
         self.assertEqual(response.data["count_unique_nonce"], 1)
 
+        #
+        # Mock get_queryset with empty queryset return value to get proper error in case of fail
+        with mock.patch.object(
+            SafeMultisigTransactionListView,
+            "get_queryset",
+            return_value=MultisigTransaction.objects.none(),
+        ) as patched_queryset:
+            response = self.client.get(
+                reverse("v1:history:multisig-transactions", args=(safe_address,)),
+                format="json",
+            )
+            # view shouldn't be called
+            patched_queryset.assert_not_called()
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(response.data["count"], 2)
+            self.assertEqual(response.data["count_unique_nonce"], 1)
+
     def test_get_multisig_transactions_unique_nonce(self):
         """
         Unique nonce should follow the trusted filter
         """
 
-        safe_address = Account.create().address
+        safe = self.deploy_test_safe()
+        safe_address = safe.address
         url = reverse("v1:history:multisig-transactions", args=(safe_address,))
         response = self.client.get(
             url,
@@ -1137,11 +1353,15 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self, get_data_decoded_mock: MagicMock
     ):
         try:
+            safe = self.deploy_test_safe()
+            safe_address = safe.address
             ContractQuerySet.cache_trusted_addresses_for_delegate_call.clear()
             multisig_transaction = MultisigTransactionFactory(
-                operation=SafeOperationEnum.CALL.value, data=b"abcd", trusted=True
+                safe=safe_address,
+                operation=SafeOperationEnum.CALL.value,
+                data=b"abcd",
+                trusted=True,
             )
-            safe_address = multisig_transaction.safe
             response = self.client.get(
                 reverse("v1:history:multisig-transactions", args=(safe_address,)),
                 format="json",
@@ -1160,23 +1380,31 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             self.assertEqual(response.status_code, status.HTTP_200_OK)
             self.assertIsNone(response.data["results"][0]["data_decoded"])
 
-            ContractQuerySet.cache_trusted_addresses_for_delegate_call.clear()
             ContractFactory(
                 address=multisig_transaction.to, trusted_for_delegate_call=True
             )
-            response = self.client.get(
-                reverse("v1:history:multisig-transactions", args=(safe_address,)),
-                format="json",
-            )
-            self.assertEqual(response.status_code, status.HTTP_200_OK)
-            self.assertEqual(
-                response.data["results"][0]["data_decoded"], {"param1": "value"}
-            )
+            ContractQuerySet.cache_trusted_addresses_for_delegate_call.clear()
+            # Force don't use cache because we are not cleaning the cache on contracts change
+            with mock.patch(
+                "safe_transaction_service.history.views.settings.CACHE_VIEW_DEFAULT_TIMEOUT",
+                0,
+            ):
+                response = self.client.get(
+                    reverse("v1:history:multisig-transactions", args=(safe_address,)),
+                    format="json",
+                )
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                self.assertEqual(
+                    response.data["results"][0]["data_decoded"], {"param1": "value"}
+                )
         finally:
             ContractQuerySet.cache_trusted_addresses_for_delegate_call.clear()
 
     def test_get_multisig_transactions_filters(self):
-        safe_address = Account.create().address
+        safe_owner_1 = Account.create()
+        safe = self.deploy_test_safe(owners=[safe_owner_1.address])
+        safe_address = safe.address
+
         response = self.client.get(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
             format="json",
@@ -1185,7 +1413,11 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["count"], 0)
 
         multisig_transaction = MultisigTransactionFactory(
-            safe=safe_address, nonce=0, ethereum_tx=None, trusted=True
+            safe=safe_address,
+            nonce=0,
+            ethereum_tx=None,
+            trusted=True,
+            enable_safe_tx_hash_calculation=True,
         )
         response = self.client.get(
             reverse("v1:history:multisig-transactions", args=(safe_address,))
@@ -1245,7 +1477,10 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data["results"]), 0)
 
-        MultisigConfirmationFactory(multisig_transaction=multisig_transaction)
+        MultisigConfirmationFactory(
+            multisig_transaction=multisig_transaction,
+            force_sign_with_account=safe_owner_1,
+        )
         response = self.client.get(
             reverse("v1:history:multisig-transactions", args=(safe_address,))
             + "?has_confirmations=True",
@@ -1295,7 +1530,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             data["refundReceiver"],
             safe_nonce=data["nonce"],
         )
-        data["contractTransactionHash"] = safe_tx.safe_tx_hash.hex()
+        data["contractTransactionHash"] = to_0x_hex_str(safe_tx.safe_tx_hash)
         response = self.client.post(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
             format="json",
@@ -1355,7 +1590,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             data["refundReceiver"],
             safe_nonce=data["nonce"],
         )
-        data["contractTransactionHash"] = safe_tx.safe_tx_hash.hex()
+        data["contractTransactionHash"] = to_0x_hex_str(safe_tx.safe_tx_hash)
         response = self.client.post(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
             format="json",
@@ -1376,11 +1611,12 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertIsNone(response.data["executor"])
         self.assertEqual(len(response.data["confirmations"]), 0)
         self.assertEqual(response.data["proposer"], data["sender"])
+        self.assertIsNone(response.data["proposed_by_delegate"])
 
         # Test confirmation with signature
-        data["signature"] = safe_owner_1.signHash(safe_tx.safe_tx_hash)[
-            "signature"
-        ].hex()
+        data["signature"] = to_0x_hex_str(
+            safe_owner_1.unsafe_sign_hash(safe_tx.safe_tx_hash)["signature"]
+        )
         response = self.client.post(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
             format="json",
@@ -1409,9 +1645,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
 
         # Sign with a different user that sender
         random_user_account = Account.create()
-        data["signature"] = random_user_account.signHash(safe_tx.safe_tx_hash)[
-            "signature"
-        ].hex()
+        data["signature"] = to_0x_hex_str(
+            random_user_account.unsafe_sign_hash(safe_tx.safe_tx_hash)["signature"]
+        )
         response = self.client.post(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
             format="json",
@@ -1475,7 +1711,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             data["refundReceiver"],
             safe_nonce=data["nonce"],
         )
-        data["contractTransactionHash"] = safe_tx.safe_tx_hash.hex()
+        data["contractTransactionHash"] = to_0x_hex_str(safe_tx.safe_tx_hash)
         response = self.client.post(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
             format="json",
@@ -1519,7 +1755,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         safe_tx_hash_preimage = safe_tx.safe_tx_hash_preimage
 
         safe_owner_message_hash = safe_owner.get_message_hash(safe_tx_hash_preimage)
-        safe_owner_signature = account.signHash(safe_owner_message_hash)["signature"]
+        safe_owner_signature = account.unsafe_sign_hash(safe_owner_message_hash)[
+            "signature"
+        ]
         signature_1271 = (
             signature_to_bytes(
                 0, int.from_bytes(HexBytes(safe_owner.address), byteorder="big"), 65
@@ -1527,8 +1765,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             + eth_abi.encode(["bytes"], [safe_owner_signature])[32:]
         )
 
-        data["contractTransactionHash"] = safe_tx_hash.hex()
-        data["signature"] = signature_1271.hex()
+        data["contractTransactionHash"] = to_0x_hex_str(safe_tx_hash)
+        data["signature"] = to_0x_hex_str(signature_1271)
 
         response = self.client.post(
             reverse("v1:history:multisig-transactions", args=(safe.address,)),
@@ -1536,6 +1774,14 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             data=data,
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        # Ensure right response is returned
+        response = self.client.get(
+            reverse("v1:history:multisig-transactions", args=(safe.address,)),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
         multisig_transaction_db = MultisigTransaction.objects.get(
             safe_tx_hash=safe_tx_hash
         )
@@ -1548,7 +1794,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         response = self.client.post(
             reverse(
                 "v1:history:multisig-transaction-confirmations",
-                args=(safe_tx_hash.hex(),),
+                args=(to_0x_hex_str(safe_tx_hash),),
             ),
             format="json",
             data=confirmation_data,
@@ -1586,7 +1832,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             data["refundReceiver"],
             safe_nonce=data["nonce"],
         )
-        data["contractTransactionHash"] = safe_tx.safe_tx_hash.hex()
+        data["contractTransactionHash"] = to_0x_hex_str(safe_tx.safe_tx_hash)
 
         factory = APIRequestFactory()
         request = factory.post(
@@ -1669,7 +1915,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             data["refundReceiver"],
             safe_nonce=data["nonce"],
         )
-        data["contractTransactionHash"] = safe_tx.safe_tx_hash.hex()
+        data["contractTransactionHash"] = to_0x_hex_str(safe_tx.safe_tx_hash)
         response = self.client.post(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
             format="json",
@@ -1694,7 +1940,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY)
         self.assertIn(
-            f'Tx with safe-tx-hash={data["contractTransactionHash"]} '
+            f"Tx with safe-tx-hash={data['contractTransactionHash']} "
             f"for safe={safe.address} was already executed in "
             f"tx-hash={multisig_transaction.ethereum_tx_id}",
             response.data["non_field_errors"],
@@ -1714,7 +1960,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             data["refundReceiver"],
             safe_nonce=data["nonce"],
         )
-        data["contractTransactionHash"] = safe_tx.safe_tx_hash.hex()
+        data["contractTransactionHash"] = to_0x_hex_str(safe_tx.safe_tx_hash)
         response = self.client.post(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
             format="json",
@@ -1741,7 +1987,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             data["refundReceiver"],
             safe_nonce=data["nonce"],
         )
-        data["contractTransactionHash"] = safe_tx.safe_tx_hash.hex()
+        data["contractTransactionHash"] = to_0x_hex_str(safe_tx.safe_tx_hash)
         response = self.client.post(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
             format="json",
@@ -1791,7 +2037,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             data["refundReceiver"],
             safe_nonce=data["nonce"],
         )
-        data["contractTransactionHash"] = safe_tx.safe_tx_hash.hex()
+        data["contractTransactionHash"] = to_0x_hex_str(safe_tx.safe_tx_hash)
         response = self.client.post(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
             format="json",
@@ -1823,7 +2069,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             data["refundReceiver"],
             safe_nonce=data["nonce"],
         )
-        data["contractTransactionHash"] = safe_tx.safe_tx_hash.hex()
+        data["contractTransactionHash"] = to_0x_hex_str(safe_tx.safe_tx_hash)
         response = self.client.post(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
             format="json",
@@ -1878,13 +2124,15 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             safe_nonce=data["nonce"],
         )
         safe_tx_hash = safe_tx.safe_tx_hash
-        data["contractTransactionHash"] = safe_tx_hash.hex()
-        data["signature"] = b"".join(
-            [
-                safe_owner.signHash(safe_tx_hash)["signature"]
-                for safe_owner in safe_owners
-            ]
-        ).hex()
+        data["contractTransactionHash"] = to_0x_hex_str(safe_tx_hash)
+        data["signature"] = to_0x_hex_str(
+            b"".join(
+                [
+                    safe_owner.unsafe_sign_hash(safe_tx_hash)["signature"]
+                    for safe_owner in safe_owners
+                ]
+            )
+        )
         response = self.client.post(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
             format="json",
@@ -1949,8 +2197,10 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             safe_nonce=data["nonce"],
         )
         safe_tx_hash = safe_tx.safe_tx_hash
-        data["contractTransactionHash"] = safe_tx_hash.hex()
-        data["signature"] = safe_delegate.signHash(safe_tx_hash)["signature"].hex()
+        data["contractTransactionHash"] = to_0x_hex_str(safe_tx_hash)
+        data["signature"] = to_0x_hex_str(
+            safe_delegate.unsafe_sign_hash(safe_tx_hash)["signature"]
+        )
 
         response = self.client.post(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
@@ -1999,6 +2249,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         # Proposer should be the owner address not the delegate
         self.assertNotEqual(multisig_transaction.proposer, safe_delegate.address)
         self.assertEqual(multisig_transaction.proposer, safe_owners[0].address)
+        self.assertEqual(
+            multisig_transaction.proposed_by_delegate, safe_delegate.address
+        )
 
         data["signature"] = data["signature"] + data["signature"][2:]
         response = self.client.post(
@@ -2011,6 +2264,147 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             "Just one signature is expected if using delegates",
             response.data["non_field_errors"][0],
         )
+
+    def test_post_multisig_transactions_with_banned_signatures(self):
+        safe_owners = [Account.create() for _ in range(4)]
+        safe_owner_addresses = [s.address for s in safe_owners]
+        safe = self.deploy_test_safe(owners=safe_owner_addresses, threshold=3)
+        safe_address = safe.address
+
+        data = {
+            "to": Account.create().address,
+            "value": 100000000000000000,
+            "data": None,
+            "operation": 0,
+            "nonce": 0,
+            "safeTxGas": 0,
+            "baseGas": 0,
+            "gasPrice": 0,
+            "gasToken": "0x0000000000000000000000000000000000000000",
+            "refundReceiver": "0x0000000000000000000000000000000000000000",
+            # "contractTransactionHash": "0x1c2c77b29086701ccdda7836c399112a9b715c6a153f6c8f75c84da4297f60d3",
+            "sender": safe_owners[0].address,
+            "origin": "Testing origin field",
+        }
+
+        safe_tx = safe.build_multisig_tx(
+            data["to"],
+            data["value"],
+            data["data"],
+            data["operation"],
+            data["safeTxGas"],
+            data["baseGas"],
+            data["gasPrice"],
+            data["gasToken"],
+            data["refundReceiver"],
+            safe_nonce=data["nonce"],
+        )
+        safe_tx_hash = safe_tx.safe_tx_hash
+        data["contractTransactionHash"] = to_0x_hex_str(safe_tx_hash)
+        data["signature"] = to_0x_hex_str(
+            b"".join(
+                [
+                    safe_owner.unsafe_sign_hash(safe_tx_hash)["signature"]
+                    for safe_owner in safe_owners
+                ]
+            )
+        )
+        with self.settings(BANNED_EOAS={safe_owners[0].address}):
+            response = self.client.post(
+                reverse("v1:history:multisig-transactions", args=(safe_address,)),
+                format="json",
+                data=data,
+            )
+            self.assertEqual(response.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY)
+            self.assertEqual(
+                response.json(),
+                {
+                    "nonFieldErrors": [
+                        f"Signer={safe_owners[0].address} is not authorized to interact with the service"
+                    ]
+                },
+            )
+
+    def test_post_multisig_transaction_with_delegate_call(self):
+        safe_owner_1 = Account.create()
+        safe = self.deploy_test_safe(owners=[safe_owner_1.address])
+        safe_address = safe.address
+        try:
+            response = self.client.get(
+                reverse("v1:history:multisig-transactions", args=(safe_address,)),
+                format="json",
+            )
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(response.data["count"], 0)
+
+            data = {
+                "to": Account.create().address,
+                "value": 0,
+                "data": "0x12121212",
+                "operation": SafeOperationEnum.DELEGATE_CALL.value,
+                "nonce": 0,
+                "safeTxGas": 0,
+                "baseGas": 0,
+                "gasPrice": 0,
+                "gasToken": "0x0000000000000000000000000000000000000000",
+                "refundReceiver": "0x0000000000000000000000000000000000000000",
+                "sender": safe_owner_1.address,
+            }
+            safe_tx = safe.build_multisig_tx(
+                data["to"],
+                data["value"],
+                data["data"],
+                data["operation"],
+                data["safeTxGas"],
+                data["baseGas"],
+                data["gasPrice"],
+                data["gasToken"],
+                data["refundReceiver"],
+                safe_nonce=data["nonce"],
+            )
+            data["contractTransactionHash"] = to_0x_hex_str(safe_tx.safe_tx_hash)
+
+            ContractQuerySet.cache_trusted_addresses_for_delegate_call.clear()
+            # Disable creation with delegate call and not trusted contract
+            with self.settings(
+                DISABLE_CREATION_MULTISIG_TRANSACTIONS_WITH_DELEGATE_CALL_OPERATION=True
+            ):
+                response = self.client.post(
+                    reverse("v1:history:multisig-transactions", args=(safe_address,)),
+                    format="json",
+                    data=data,
+                )
+                self.assertEqual(
+                    response.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY
+                )
+
+            # Enable creation with delegate call
+            with self.settings(
+                DISABLE_CREATION_MULTISIG_TRANSACTIONS_WITH_DELEGATE_CALL_OPERATION=False
+            ):
+                response = self.client.post(
+                    reverse("v1:history:multisig-transactions", args=(safe_address,)),
+                    format="json",
+                    data=data,
+                )
+                self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+                multisig_transaction_db = MultisigTransaction.objects.first()
+                self.assertEqual(multisig_transaction_db.operation, 1)
+
+            # Disable creation with delegate call and trusted contract
+            ContractFactory(address=data["to"], trusted_for_delegate_call=True)
+            ContractQuerySet.cache_trusted_addresses_for_delegate_call.clear()
+            with self.settings(
+                DISABLE_CREATION_MULTISIG_TRANSACTIONS_WITH_DELEGATE_CALL_OPERATION=True
+            ):
+                response = self.client.post(
+                    reverse("v1:history:multisig-transactions", args=(safe_address,)),
+                    format="json",
+                    data=data,
+                )
+                self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        finally:
+            ContractQuerySet.cache_trusted_addresses_for_delegate_call.clear()
 
     def test_safe_balances_view(self):
         safe_address = Account.create().address
@@ -2093,79 +2487,6 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             ],
         )
 
-    @mock.patch.object(BalanceService, "get_token_info", autospec=True)
-    @mock.patch.object(timezone, "now", return_value=timezone.now())
-    def test_safe_balances_usd_view(
-        self,
-        timezone_now_mock: MagicMock,
-        get_token_info_mock: MagicMock,
-    ):
-        timestamp_str = "1970-01-01T00:00:00Z"
-        safe_address = Account.create().address
-        response = self.client.get(
-            reverse("v1:history:safe-balances-usd", args=(safe_address,)), format="json"
-        )
-        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
-
-        SafeContractFactory(address=safe_address)
-        value = 7
-        self.send_ether(safe_address, 7)
-        response = self.client.get(
-            reverse("v1:history:safe-balances-usd", args=(safe_address,)), format="json"
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(response.data), 1)
-        self.assertIsNone(response.data[0]["token_address"])
-        self.assertEqual(response.data[0]["balance"], str(value))
-        self.assertEqual(response.data[0]["eth_value"], "0.0")
-
-        tokens_value = int(12 * 1e18)
-        erc20 = self.deploy_example_erc20(tokens_value, safe_address)
-        response = self.client.get(
-            reverse("v1:history:safe-balances-usd", args=(safe_address,)), format="json"
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(response.data), 1)
-
-        erc20_info = Erc20InfoWithLogo(
-            erc20.address, "UXIO", "UXI", 18, None, "http://logo_uri.es"
-        )
-        get_token_info_mock.return_value = erc20_info
-
-        ERC20TransferFactory(address=erc20.address, to=safe_address)
-        response = self.client.get(
-            reverse("v1:history:safe-balances-usd", args=(safe_address,)), format="json"
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        token_dict = asdict(erc20_info)
-        del token_dict["address"]
-        del token_dict["copy_price"]
-        self.assertCountEqual(
-            response.data,
-            [
-                {
-                    "token_address": None,
-                    "token": None,
-                    "balance": str(value),
-                    "eth_value": "0.0",
-                    "timestamp": timestamp_str,
-                    "fiat_balance": "0.0",
-                    "fiat_conversion": "0.0",
-                    "fiat_code": "USD",
-                },  # 7 wei is rounded to 0.0
-                {
-                    "token_address": erc20.address,
-                    "token": token_dict,
-                    "balance": str(tokens_value),
-                    "eth_value": "0.0",
-                    "timestamp": timestamp_str,
-                    "fiat_balance": "0.0",
-                    "fiat_conversion": "0.0",
-                    "fiat_code": "USD",
-                },
-            ],
-        )
-
     def test_delegates_post(self):
         url = reverse("v1:history:delegates")
         safe_address = Account.create().address
@@ -2215,7 +2536,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             # Create delegate
             self.assertEqual(SafeContractDelegate.objects.count(), 0)
             hash_to_sign = DelegateSignatureHelper.calculate_hash(delegate.address)
-            data["signature"] = delegator.signHash(hash_to_sign)["signature"].hex()
+            data["signature"] = to_0x_hex_str(
+                delegator.unsafe_sign_hash(hash_to_sign)["signature"]
+            )
             response = self.client.post(url, format="json", data=data)
             self.assertEqual(response.status_code, status.HTTP_201_CREATED)
             safe_contract_delegate = SafeContractDelegate.objects.get()
@@ -2223,6 +2546,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             self.assertEqual(safe_contract_delegate.delegator, delegator.address)
             self.assertEqual(safe_contract_delegate.label, label)
             self.assertEqual(safe_contract_delegate.safe_contract_id, safe_address)
+            self.assertEqual(safe_contract_delegate.expiry_date, None)
 
             # Update label
             label = "Jimmy McGill"
@@ -2232,6 +2556,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             self.assertEqual(SafeContractDelegate.objects.count(), 1)
             safe_contract_delegate = SafeContractDelegate.objects.get()
             self.assertEqual(safe_contract_delegate.label, label)
+            self.assertEqual(safe_contract_delegate.expiry_date, None)
 
         # Create delegate without a Safe
         another_label = "Kim Wexler"
@@ -2239,9 +2564,13 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             "label": another_label,
             "delegate": delegate.address,
             "delegator": delegator.address,
-            "signature": delegator.signHash(
-                DelegateSignatureHelper.calculate_hash(delegate.address, eth_sign=True)
-            )["signature"].hex(),
+            "signature": to_0x_hex_str(
+                delegator.unsafe_sign_hash(
+                    DelegateSignatureHelper.calculate_hash(
+                        delegate.address, eth_sign=True
+                    )
+                )["signature"]
+            ),
         }
         response = self.client.post(url, format="json", data=data)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
@@ -2251,7 +2580,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         signature = signature_to_bytes(0, int(delegator.address, 16), 65) + HexBytes(
             "0" * 65
         )
-        data["signature"] = signature.hex()
+        data["signature"] = to_0x_hex_str(signature)
         response = self.client.post(url, format="json", data=data)
         self.assertIn(
             f"Signature of type=CONTRACT_SIGNATURE for delegator={delegator.address} is not valid",
@@ -2265,7 +2594,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         )
         self.assertEqual(len(queryset), 2)
         self.assertCountEqual(
-            set(safe_contract_delegate.delegate for safe_contract_delegate in queryset),
+            {safe_contract_delegate.delegate for safe_contract_delegate in queryset},
             {delegate.address},
         )
 
@@ -2293,12 +2622,14 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                 "delegator": safe_contract_delegate_1.delegator,
                 "label": safe_contract_delegate_1.label,
                 "safe": safe_contract.address,
+                "expiry_date": datetime_to_str(safe_contract_delegate_1.expiry_date),
             },
             {
                 "delegate": safe_contract_delegate_2.delegate,
                 "delegator": safe_contract_delegate_2.delegator,
                 "label": safe_contract_delegate_2.label,
                 "safe": safe_contract.address,
+                "expiry_date": datetime_to_str(safe_contract_delegate_2.expiry_date),
             },
         ]
         response = self.client.get(
@@ -2316,12 +2647,14 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                 "delegator": safe_contract_delegate_1.delegator,
                 "label": safe_contract_delegate_1.label,
                 "safe": safe_contract.address,
+                "expiry_date": datetime_to_str(safe_contract_delegate_1.expiry_date),
             },
             {
                 "delegate": safe_contract_delegate_3.delegate,
                 "delegator": safe_contract_delegate_3.delegator,
                 "label": safe_contract_delegate_3.label,
                 "safe": safe_contract_delegate_3.safe_contract_id,
+                "expiry_date": datetime_to_str(safe_contract_delegate_3.expiry_date),
             },
         ]
         response = self.client.get(
@@ -2350,7 +2683,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                     delegate=delegate.address,  # random delegator, should not be deleted
                 )
                 data = {
-                    "signature": signer.signHash(hash_to_sign)["signature"].hex(),
+                    "signature": to_0x_hex_str(
+                        signer.unsafe_sign_hash(hash_to_sign)["signature"]
+                    ),
                     "delegator": delegator.address,
                 }
                 self.assertEqual(SafeContractDelegate.objects.count(), 3)
@@ -2375,7 +2710,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         )
         signer = Account.create()
         data = {
-            "signature": signer.signHash(hash_to_sign)["signature"].hex(),
+            "signature": to_0x_hex_str(
+                signer.unsafe_sign_hash(hash_to_sign)["signature"]
+            ),
             "delegator": delegator.address,
         }
         self.assertEqual(SafeContractDelegate.objects.count(), 1)
@@ -2458,37 +2795,49 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         hash_to_sign = DelegateSignatureHelper.calculate_hash(
             delegate_address, eth_sign=True
         )
-        data["signature"] = owner_account.signHash(hash_to_sign)["signature"].hex()
+        data["signature"] = to_0x_hex_str(
+            owner_account.unsafe_sign_hash(hash_to_sign)["signature"]
+        )
         response = self.client.delete(
             reverse("v1:history:safe-delegate", args=(safe_address, delegate_address)),
             format="json",
             data=data,
         )
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
-        self.assertIn("Not found", response.data["detail"])
+        self.assertEqual(
+            "No SafeContractDelegate matches the given query.", response.data["detail"]
+        )
 
         # Test previous otp
         hash_to_sign = DelegateSignatureHelper.calculate_hash(
             delegate_address, previous_totp=True
         )
-        data["signature"] = owner_account.signHash(hash_to_sign)["signature"].hex()
+        data["signature"] = to_0x_hex_str(
+            owner_account.unsafe_sign_hash(hash_to_sign)["signature"]
+        )
         response = self.client.delete(
             reverse("v1:history:safe-delegate", args=(safe_address, delegate_address)),
             format="json",
             data=data,
         )
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
-        self.assertIn("Not found", response.data["detail"])
+        self.assertEqual(
+            "No SafeContractDelegate matches the given query.", response.data["detail"]
+        )
 
         hash_to_sign = DelegateSignatureHelper.calculate_hash(delegate_address)
-        data["signature"] = owner_account.signHash(hash_to_sign)["signature"].hex()
+        data["signature"] = to_0x_hex_str(
+            owner_account.unsafe_sign_hash(hash_to_sign)["signature"]
+        )
         response = self.client.delete(
             reverse("v1:history:safe-delegate", args=(safe_address, delegate_address)),
             format="json",
             data=data,
         )
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
-        self.assertIn("Not found", response.data["detail"])
+        self.assertEqual(
+            "No SafeContractDelegate matches the given query.", response.data["detail"]
+        )
 
         SafeContractDelegateFactory(
             safe_contract=safe_contract, delegate=delegate_address
@@ -2512,7 +2861,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             safe_contract=safe_contract, delegate=delegate_account.address
         )
         hash_to_sign = DelegateSignatureHelper.calculate_hash(delegate_account.address)
-        data["signature"] = delegate_account.signHash(hash_to_sign)["signature"].hex()
+        data["signature"] = to_0x_hex_str(
+            delegate_account.unsafe_sign_hash(hash_to_sign)["signature"]
+        )
         response = self.client.delete(
             reverse(
                 "v1:history:safe-delegate",
@@ -2606,8 +2957,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             [
                 {
                     "type": TransferType.ERC20_TRANSFER.name,
-                    "executionDate": ethereum_erc_20_event.ethereum_tx.block.timestamp.isoformat().replace(
-                        "+00:00", "Z"
+                    "executionDate": datetime_to_str(
+                        ethereum_erc_20_event.ethereum_tx.block.timestamp
                     ),
                     "transferId": erc20_transfer_id,
                     "transactionHash": ethereum_erc_20_event.ethereum_tx_id,
@@ -2629,8 +2980,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                 },
                 {
                     "type": TransferType.ETHER_TRANSFER.name,
-                    "executionDate": internal_tx.ethereum_tx.block.timestamp.isoformat().replace(
-                        "+00:00", "Z"
+                    "executionDate": datetime_to_str(
+                        internal_tx.ethereum_tx.block.timestamp
                     ),
                     "transferId": internal_tx_transfer_id,
                     "transactionHash": internal_tx.ethereum_tx_id,
@@ -2667,8 +3018,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             [
                 {
                     "type": TransferType.ERC721_TRANSFER.name,
-                    "executionDate": ethereum_erc_721_event.ethereum_tx.block.timestamp.isoformat().replace(
-                        "+00:00", "Z"
+                    "executionDate": datetime_to_str(
+                        ethereum_erc_721_event.ethereum_tx.block.timestamp
                     ),
                     "transferId": erc721_transfer_id,
                     "transactionHash": ethereum_erc_721_event.ethereum_tx_id,
@@ -2682,8 +3033,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                 },
                 {
                     "type": TransferType.ERC20_TRANSFER.name,
-                    "executionDate": ethereum_erc_20_event.ethereum_tx.block.timestamp.isoformat().replace(
-                        "+00:00", "Z"
+                    "executionDate": datetime_to_str(
+                        ethereum_erc_20_event.ethereum_tx.block.timestamp
                     ),
                     "transferId": erc20_transfer_id,
                     "transactionHash": ethereum_erc_20_event.ethereum_tx_id,
@@ -2705,8 +3056,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                 },
                 {
                     "type": TransferType.ETHER_TRANSFER.name,
-                    "executionDate": internal_tx.ethereum_tx.block.timestamp.isoformat().replace(
-                        "+00:00", "Z"
+                    "executionDate": datetime_to_str(
+                        internal_tx.ethereum_tx.block.timestamp
                     ),
                     "transferId": internal_tx_transfer_id,
                     "transactionHash": internal_tx.ethereum_tx_id,
@@ -2837,8 +3188,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         expected_results = [
             {
                 "type": TransferType.ERC20_TRANSFER.name,
-                "executionDate": ethereum_erc_20_event_2.ethereum_tx.block.timestamp.isoformat().replace(
-                    "+00:00", "Z"
+                "executionDate": datetime_to_str(
+                    ethereum_erc_20_event_2.ethereum_tx.block.timestamp
                 ),
                 "blockNumber": ethereum_erc_20_event_2.ethereum_tx.block_id,
                 "transferId": erc20_transfer_id_2,
@@ -2852,8 +3203,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             },
             {
                 "type": TransferType.ERC20_TRANSFER.name,
-                "executionDate": ethereum_erc_20_event.ethereum_tx.block.timestamp.isoformat().replace(
-                    "+00:00", "Z"
+                "executionDate": datetime_to_str(
+                    ethereum_erc_20_event.ethereum_tx.block.timestamp
                 ),
                 "blockNumber": ethereum_erc_20_event.ethereum_tx.block_id,
                 "transferId": erc20_transfer_id,
@@ -2875,8 +3226,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             },
             {
                 "type": TransferType.ETHER_TRANSFER.name,
-                "executionDate": internal_tx_2.ethereum_tx.block.timestamp.isoformat().replace(
-                    "+00:00", "Z"
+                "executionDate": datetime_to_str(
+                    internal_tx_2.ethereum_tx.block.timestamp
                 ),
                 "blockNumber": internal_tx_2.ethereum_tx.block_id,
                 "transferId": internal_tx_2_transfer_id,
@@ -2890,8 +3241,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             },
             {
                 "type": TransferType.ETHER_TRANSFER.name,
-                "executionDate": internal_tx.ethereum_tx.block.timestamp.isoformat().replace(
-                    "+00:00", "Z"
+                "executionDate": datetime_to_str(
+                    internal_tx.ethereum_tx.block.timestamp
                 ),
                 "blockNumber": internal_tx.ethereum_tx.block_id,
                 "transferId": internal_tx_transfer_id,
@@ -2935,8 +3286,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         expected_results = [
             {
                 "type": TransferType.ERC721_TRANSFER.name,
-                "executionDate": ethereum_erc_721_event_2.ethereum_tx.block.timestamp.isoformat().replace(
-                    "+00:00", "Z"
+                "executionDate": datetime_to_str(
+                    ethereum_erc_721_event_2.ethereum_tx.block.timestamp
                 ),
                 "transactionHash": ethereum_erc_721_event_2.ethereum_tx_id,
                 "transferId": erc721_transfer_id_2,
@@ -2950,8 +3301,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             },
             {
                 "type": TransferType.ERC721_TRANSFER.name,
-                "executionDate": ethereum_erc_721_event.ethereum_tx.block.timestamp.isoformat().replace(
-                    "+00:00", "Z"
+                "executionDate": datetime_to_str(
+                    ethereum_erc_721_event.ethereum_tx.block.timestamp
                 ),
                 "transactionHash": ethereum_erc_721_event.ethereum_tx_id,
                 "transferId": erc721_transfer_id,
@@ -3007,13 +3358,26 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         for result in response.data["results"]:
             self.assertEqual(result["type"], TransferType.ETHER_TRANSFER.name)
 
-        response = self.client.get(
-            reverse("v1:history:transfers", args=(safe_address,)) + "?ether=false",
-            format="json",
-        )
+        url = reverse("v1:history:transfers", args=(safe_address,)) + "?ether=false"
+        response = self.client.get(url, format="json")
         self.assertGreater(len(response.data["results"]), 0)
         for result in response.data["results"]:
             self.assertNotEqual(result["type"], TransferType.ETHER_TRANSFER.name)
+
+        # Test that the result should be cached
+        # Mock get_queryset with empty queryset return value to get proper error in case of fail
+        with mock.patch.object(
+            SafeTransferListView,
+            "get_queryset",
+            return_value=InternalTx.objects.none(),
+        ) as patched_queryset:
+            response = self.client.get(url, format="json")
+            # queryset shouldn't be called
+            patched_queryset.assert_not_called()
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertGreater(len(response.data["results"]), 0)
+            for result in response.data["results"]:
+                self.assertNotEqual(result["type"], TransferType.ETHER_TRANSFER.name)
 
     def test_get_transfer_view(self):
         # test wrong random transfer_id
@@ -3062,7 +3426,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
-        # Test getting ether incomming transfer
+        # Test getting ether incoming transfer
         transfer_id = (
             "i4f6754000f0432d3b5e6d8341597ec3c5338239f8d311de9061fbc959f443d590"
         )
@@ -3073,9 +3437,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         expected_result = {
             "type": TransferType.ETHER_TRANSFER.name,
-            "executionDate": internal_tx.ethereum_tx.block.timestamp.isoformat().replace(
-                "+00:00", "Z"
-            ),
+            "executionDate": datetime_to_str(internal_tx.ethereum_tx.block.timestamp),
             "blockNumber": internal_tx.ethereum_tx.block_id,
             "transferId": transfer_id,
             "transactionHash": internal_tx.ethereum_tx_id,
@@ -3106,8 +3468,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         expected_result = {
             "type": TransferType.ETHER_TRANSFER.name,
-            "executionDate": internal_tx_empty_trace_address.ethereum_tx.block.timestamp.isoformat().replace(
-                "+00:00", "Z"
+            "executionDate": datetime_to_str(
+                internal_tx_empty_trace_address.ethereum_tx.block.timestamp
             ),
             "blockNumber": internal_tx_empty_trace_address.ethereum_tx.block_id,
             "transferId": transfer_id_empty_trace_address,
@@ -3140,8 +3502,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         expected_result = {
             "type": TransferType.ERC20_TRANSFER.name,
-            "executionDate": ethereum_erc_20_event.ethereum_tx.block.timestamp.isoformat().replace(
-                "+00:00", "Z"
+            "executionDate": datetime_to_str(
+                ethereum_erc_20_event.ethereum_tx.block.timestamp
             ),
             "blockNumber": ethereum_erc_20_event.ethereum_tx.block_id,
             "transferId": transfer_id,
@@ -3182,8 +3544,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         expected_result = {
             "type": TransferType.ERC721_TRANSFER.name,
-            "executionDate": ethereum_erc_721_event.ethereum_tx.block.timestamp.isoformat().replace(
-                "+00:00", "Z"
+            "executionDate": datetime_to_str(
+                ethereum_erc_721_event.ethereum_tx.block.timestamp
             ),
             "transactionHash": ethereum_erc_721_event.ethereum_tx_id,
             "transferId": transfer_id,
@@ -3204,9 +3566,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY)
 
-        owner_address = Account.create().address
+        safe_address = Account.create().address
         response = self.client.get(
-            reverse("v1:history:safe-creation", args=(owner_address,))
+            reverse("v1:history:safe-creation", args=(safe_address,))
         )
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
@@ -3215,28 +3577,29 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         ):
             # Insert create contract internal tx
             internal_tx = InternalTxFactory(
-                contract_address=owner_address,
+                contract_address=safe_address,
                 trace_address="0,0",
                 ethereum_tx__status=1,
+                tx_type=InternalTxType.CREATE.value,
             )
             response = self.client.get(
-                reverse("v1:history:safe-creation", args=(owner_address,)),
+                reverse("v1:history:safe-creation", args=(safe_address,)),
                 format="json",
             )
             self.assertEqual(response.status_code, status.HTTP_200_OK)
-            created_iso = internal_tx.ethereum_tx.block.timestamp.isoformat().replace(
-                "+00:00", "Z"
-            )
+            created_iso = datetime_to_str(internal_tx.ethereum_tx.block.timestamp)
             expected = {
                 "created": created_iso,
                 "creator": internal_tx.ethereum_tx._from,
                 "factory_address": internal_tx._from,
                 "master_copy": None,
                 "setup_data": None,
+                "salt_nonce": None,
                 "data_decoded": None,
                 "transaction_hash": internal_tx.ethereum_tx_id,
+                "user_operation": None,
             }
-            self.assertEqual(response.data, expected)
+            self.assertDictEqual(response.data, expected)
 
         # Next children internal_tx should not alter the result
         another_trace = dict(call_trace)
@@ -3248,11 +3611,62 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             return_value=[another_trace],
         ):
             response = self.client.get(
-                reverse("v1:history:safe-creation", args=(owner_address,)),
+                reverse("v1:history:safe-creation", args=(safe_address,)),
                 format="json",
             )
             self.assertEqual(response.status_code, status.HTTP_200_OK)
-            self.assertEqual(response.data, expected)
+            self.assertDictEqual(response.data, expected)
+
+        # Test 4337 SafeOperation showing in the creation
+        safe_operation = aa_factories.SafeOperationFactory(
+            user_operation__ethereum_tx_id=internal_tx.ethereum_tx_id,
+            user_operation__sender=safe_address,
+            user_operation__init_code=HexBytes("0x1234"),
+        )
+        response = self.client.get(
+            reverse("v1:history:safe-creation", args=(safe_address,)),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        expected["user_operation"] = {
+            "sender": safe_operation.user_operation.sender,
+            "nonce": str(safe_operation.user_operation.nonce),
+            "user_operation_hash": safe_operation.user_operation.hash,
+            "ethereum_tx_hash": internal_tx.ethereum_tx_id,
+            "init_code": "0x1234",
+            "call_data": "0x",
+            "call_gas_limit": str(safe_operation.user_operation.call_gas_limit),
+            "verification_gas_limit": str(
+                safe_operation.user_operation.verification_gas_limit
+            ),
+            "pre_verification_gas": str(
+                safe_operation.user_operation.pre_verification_gas
+            ),
+            "max_fee_per_gas": str(safe_operation.user_operation.max_fee_per_gas),
+            "max_priority_fee_per_gas": str(
+                safe_operation.user_operation.max_priority_fee_per_gas
+            ),
+            "paymaster": safe_operation.user_operation.paymaster,
+            "paymaster_data": "0x",
+            "signature": to_0x_hex_str(safe_operation.user_operation.signature),
+            "entry_point": safe_operation.user_operation.entry_point,
+            "safe_operation": {
+                "created": datetime_to_str(safe_operation.created),
+                "modified": datetime_to_str(safe_operation.created),
+                "safe_operation_hash": safe_operation.hash,
+                "valid_after": datetime_to_str(safe_operation.valid_after),
+                "valid_until": datetime_to_str(safe_operation.valid_until),
+                "module_address": safe_operation.module_address,
+                "confirmations": [],
+                "prepared_signature": to_0x_hex_str(
+                    HexBytes(safe_operation.build_signature())
+                ),
+            },
+        }
+
+        self.assertIsNotNone(response.data["user_operation"])
+        self.assertDictEqual(response.data, expected)
+        safe_operation.user_operation.delete()
 
         another_trace_2 = dict(call_trace)
         another_trace_2["traceAddress"] = [0]
@@ -3264,25 +3678,27 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         ):
             # `another_trace_2` should change the `creator` and `master_copy` and `setup_data` should appear
 
-            for test_data, data_decoded in [
-                (create_test_data_v1_0_0, data_decoded_v1_0_0),
-                (create_test_data_v1_1_1, data_decoded_v1_1_1),
-                (create_cpk_test_data, data_decoded_cpk),
-                (create_v1_4_1_test_data, data_decoded_v1_4_1),
+            for test_data, data_decoded, salt_nonce in [
+                (create_test_data_v1_0_0, data_decoded_v1_0_0, None),
+                (create_test_data_v1_1_1, data_decoded_v1_1_1, "3087219459602"),
+                (
+                    create_cpk_test_data,
+                    data_decoded_cpk,
+                    "94030236624644942756909922368015716412234033278725318725234853277280604175973",
+                ),
+                (create_v1_4_1_test_data, data_decoded_v1_4_1, "1694202208610"),
             ]:
                 with self.subTest(test_data=test_data, data_decoded=data_decoded):
                     another_trace_2["action"]["input"] = HexBytes(test_data["data"])
                     response = self.client.get(
-                        reverse("v1:history:safe-creation", args=(owner_address,)),
+                        reverse("v1:history:safe-creation", args=(safe_address,)),
                         format="json",
                     )
                     self.assertEqual(response.status_code, status.HTTP_200_OK)
-                    created_iso = (
-                        internal_tx.ethereum_tx.block.timestamp.isoformat().replace(
-                            "+00:00", "Z"
-                        )
+                    created_iso = datetime_to_str(
+                        internal_tx.ethereum_tx.block.timestamp
                     )
-                    self.assertEqual(
+                    self.assertDictEqual(
                         response.data,
                         {
                             "created": created_iso,
@@ -3291,7 +3707,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                             "factory_address": internal_tx._from,
                             "master_copy": test_data["master_copy"],
                             "setup_data": test_data["setup_data"],
+                            "salt_nonce": salt_nonce,
                             "data_decoded": data_decoded,
+                            "user_operation": None,
                         },
                     )
 
@@ -3322,7 +3740,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             },
         )
 
-        safe_last_status = SafeLastStatusFactory(address=safe_address, nonce=0)
+        SafeLastStatusFactory(address=safe_address, nonce=0)
         # For nonce=0, try to get info from blockchain
         response = self.client.get(
             reverse("v1:history:safe-info", args=(safe_address,)), format="json"
@@ -3359,7 +3777,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             response.data,
             {
                 "address": blockchain_safe.address,
-                "nonce": 0,
+                "nonce": "0",
                 "threshold": blockchain_safe.retrieve_threshold(),
                 "owners": blockchain_safe.retrieve_owners(),
                 "master_copy": blockchain_safe.retrieve_master_copy_address(),
@@ -3499,10 +3917,6 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         url = reverse("v1:history:singletons")
         return self._test_singletons_view(url)
 
-    def test_master_copies_view(self):
-        url = reverse("v1:history:master-copies")
-        return self._test_singletons_view(url)
-
     def test_modules_view(self):
         invalid_address = "0x2A"
         response = self.client.get(
@@ -3584,7 +3998,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         response = self.client.post(
             reverse("v1:history:data-decoder"),
             format="json",
-            data={"data": add_owner_with_threshold_data.hex()},
+            data={"data": to_0x_hex_str(add_owner_with_threshold_data)},
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
@@ -3651,3 +4065,890 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             data=data,
         )
         self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+
+    def test_safe_export_view(self):
+        """Test the export endpoint for CSV export functionality"""
+        safe_address = Account.create().address
+        # Test with non-existent safe
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(safe_address,)), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        # Create safe contract
+        SafeContractFactory(address=safe_address)
+
+        # Test with no transactions
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(safe_address,)), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 0)
+        self.assertEqual(response.data["results"], [])
+        self.assertIsNone(response.data["next"])
+        self.assertIsNone(response.data["previous"])
+
+        # Create some test data
+        ethereum_tx = EthereumTxFactory()
+        MultisigTransactionFactory(
+            safe=safe_address, ethereum_tx=ethereum_tx, trusted=True
+        )
+
+        # Create ERC20 transfer
+        token = TokenFactory(
+            address=Account.create().address, symbol="TEST", decimals=18
+        )
+        ERC20TransferFactory(
+            ethereum_tx=ethereum_tx,
+            address=token.address,
+            _from=Account.create().address,
+            to=safe_address,
+            value=1000000000000000000,  # 1 token with 18 decimals
+        )
+
+        # Test basic export
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(safe_address,)), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(len(response.data["results"]), 1)
+
+        result = response.json()["results"][0]
+        self.assertEqual(result["safe"], safe_address)
+        self.assertEqual(result["assetType"], "erc20")
+        self.assertEqual(result["assetAddress"], token.address)
+        self.assertEqual(result["assetSymbol"], "TEST")
+        self.assertEqual(result["assetDecimals"], 18)
+        self.assertEqual(result["amount"], "1000000000000000000")
+        self.assertIsNotNone(result["transactionHash"])
+
+        # Test pagination
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(safe_address,))
+            + "?limit=1&offset=0",
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(len(response.data["results"]), 1)
+        self.assertIsNone(response.data["next"])  # No more pages
+        self.assertIsNone(response.data["previous"])
+
+        # Test date filtering
+        future_date = timezone.now() + datetime.timedelta(days=1)
+        params = urlencode({"execution_date__gte": future_date.isoformat()})
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(safe_address,)) + f"?{params}",
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 0)
+        self.assertEqual(response.data["results"], [])
+
+        past_date = timezone.now() - datetime.timedelta(days=1)
+        params = urlencode({"execution_date__lte": past_date.isoformat()})
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(safe_address,)) + f"?{params}",
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 0)
+        self.assertEqual(response.data["results"], [])
+
+        # Test invalid date format
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(safe_address,))
+            + "?execution_date__gte=invalid-date",
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Test limit validation
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(safe_address,)) + "?limit=2000",
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        # Should default to 1000
+        self.assertEqual(len(response.data["results"]), 1)
+
+    def _setup_export_tests(self):
+        self.token = TokenFactory(
+            address=Account.create().address, symbol="TEST", decimals=18
+        )
+        self.nft_token = TokenFactory(
+            address=Account.create().address, symbol="NFT", decimals=None
+        )
+        self.safe_address = Account.create().address
+        self.external_address = Account.create().address
+        SafeContractFactory(address=self.safe_address)
+
+    def test_export_view_erc20_transfers(self):
+        self._setup_export_tests()
+        # Test OUTGOING ERC20 from multisig transaction
+        ethereum_tx_multisig_out = EthereumTxFactory()
+        multisig_tx_out = MultisigTransactionFactory(
+            safe=self.safe_address, ethereum_tx=ethereum_tx_multisig_out, trusted=True
+        )
+        multisig_outgoing_erc20_transfer = ERC20TransferFactory(
+            ethereum_tx=ethereum_tx_multisig_out,
+            address=self.token.address,
+            _from=self.safe_address,
+            to=self.external_address,
+            value=1000000000000000000,  # 1 token with 18 decimals
+        )
+
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(self.safe_address,)), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(len(response.data["results"]), 1)
+
+        result = response.json()["results"][0]
+        self.assertEqual(result["safe"], self.safe_address)
+        self.assertEqual(result["from"], self.safe_address)
+        self.assertEqual(result["to"], self.external_address)
+        self.assertEqual(result["assetType"], "erc20")
+        self.assertEqual(result["assetAddress"], self.token.address)
+        self.assertEqual(result["assetSymbol"], "TEST")
+        self.assertEqual(result["assetDecimals"], 18)
+        self.assertEqual(result["amount"], str(multisig_outgoing_erc20_transfer.value))
+        self.assertEqual(result["nonce"], str(multisig_tx_out.nonce))
+        self.assertIsNotNone(result["transactionHash"])
+
+        # Test INCOMING ERC20 from multisig transaction
+        ethereum_tx_multisig_in = EthereumTxFactory()
+        # Multisigtransaction from external Safe
+        MultisigTransactionFactory(
+            safe=self.external_address,
+            ethereum_tx=ethereum_tx_multisig_in,
+            trusted=True,
+        )
+        multisig_incoming_erc20_transfer = ERC20TransferFactory(
+            ethereum_tx=ethereum_tx_multisig_in,
+            address=self.token.address,
+            _from=self.external_address,
+            to=self.safe_address,
+            value=2000000000000000000,  # 2 tokens with 18 decimals
+        )
+
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(self.safe_address,)), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 2)
+        self.assertEqual(len(response.data["results"]), 2)
+
+        # Check the incoming transaction (should be first in results due to ordering)
+        result = response.json()["results"][0]
+        self.assertEqual(result["safe"], self.safe_address)
+        self.assertEqual(result["from"], self.external_address)
+        self.assertEqual(result["to"], self.safe_address)
+        self.assertEqual(result["assetType"], "erc20")
+        self.assertEqual(result["assetAddress"], self.token.address)
+        self.assertEqual(result["assetSymbol"], "TEST")
+        self.assertEqual(result["assetDecimals"], 18)
+        self.assertEqual(result["amount"], str(multisig_incoming_erc20_transfer.value))
+        self.assertIsNone(result["nonce"])
+        self.assertIsNotNone(result["transactionHash"])
+
+        # Test OUTGOING ERC20 from module transaction
+        ethereum_tx_module_out = EthereumTxFactory()
+        module_contract_address = Account.create().address
+        module_internal_tx_out = InternalTxFactory(
+            ethereum_tx=ethereum_tx_module_out, _from=self.safe_address, value=0
+        )
+        ModuleTransactionFactory(
+            internal_tx=module_internal_tx_out,
+            safe=self.safe_address,
+            to=module_contract_address,
+        )
+        module_outgoing_erc20 = ERC20TransferFactory(
+            ethereum_tx=ethereum_tx_module_out,
+            address=self.token.address,
+            _from=self.safe_address,
+            to=self.external_address,
+            value=3000000000000000000,  # 3 tokens with 18 decimals
+        )
+
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(self.safe_address,)), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 3)
+        self.assertEqual(len(response.data["results"]), 3)
+
+        # Check the module outgoing transaction
+        result = response.json()["results"][0]
+        self.assertEqual(result["safe"], self.safe_address)
+        self.assertEqual(result["from"], self.safe_address)
+        self.assertEqual(result["to"], self.external_address)
+        self.assertEqual(result["assetType"], "erc20")
+        self.assertEqual(result["assetAddress"], self.token.address)
+        self.assertEqual(result["assetSymbol"], "TEST")
+        self.assertEqual(result["assetDecimals"], 18)
+        self.assertEqual(result["amount"], str(module_outgoing_erc20.value))
+        self.assertIsNotNone(result["transactionHash"])
+        self.assertIsNone(result["nonce"])
+        self.assertEqual(result["contractAddress"], module_contract_address)
+
+        # Test INCOMING ERC20 from module transaction
+        ethereum_tx_module_in = EthereumTxFactory()
+        module_internal_tx_in = InternalTxFactory(
+            ethereum_tx=ethereum_tx_module_in, _from=self.safe_address, value=0
+        )
+        ModuleTransactionFactory(
+            internal_tx=module_internal_tx_in,
+            safe=self.safe_address,
+            to=module_contract_address,
+        )
+        module_incoming_erc20 = ERC20TransferFactory(
+            ethereum_tx=ethereum_tx_module_in,
+            address=self.token.address,
+            _from=self.external_address,
+            to=self.safe_address,
+            value=4000000000000000000,  # 4 tokens with 18 decimals
+        )
+
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(self.safe_address,)), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 4)
+        self.assertEqual(len(response.data["results"]), 4)
+
+        # Check the module incoming transaction
+        result = response.json()["results"][0]
+        self.assertEqual(result["safe"], self.safe_address)
+        self.assertEqual(result["from"], self.external_address)
+        self.assertEqual(result["to"], self.safe_address)
+        self.assertEqual(result["assetType"], "erc20")
+        self.assertEqual(result["assetAddress"], self.token.address)
+        self.assertEqual(result["assetSymbol"], "TEST")
+        self.assertEqual(result["assetDecimals"], 18)
+        self.assertEqual(result["amount"], str(module_incoming_erc20.value))
+        self.assertIsNotNone(result["transactionHash"])
+        self.assertIsNone(result["nonce"])
+        self.assertEqual(result["contractAddress"], module_contract_address)
+
+        # Test INCOMING ERC20 from standalone transaction
+        standalone_incoming_erc20 = ERC20TransferFactory(
+            address=self.token.address,
+            _from=self.external_address,
+            to=self.safe_address,
+            value=5000000000000000000,  # 5 tokens with 18 decimals
+        )
+
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(self.safe_address,)), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 5)
+        self.assertEqual(len(response.data["results"]), 5)
+
+        # Check the standalone incoming transaction
+        result = response.json()["results"][0]
+        self.assertEqual(result["safe"], self.safe_address)
+        self.assertEqual(result["from"], self.external_address)
+        self.assertEqual(result["to"], self.safe_address)
+        self.assertEqual(result["assetType"], "erc20")
+        self.assertEqual(result["assetAddress"], self.token.address)
+        self.assertEqual(result["assetSymbol"], "TEST")
+        self.assertEqual(result["assetDecimals"], 18)
+        self.assertEqual(result["amount"], str(standalone_incoming_erc20.value))
+        self.assertIsNotNone(result["transactionHash"])
+        self.assertIsNone(result["nonce"])
+        self.assertIsNone(result["contractAddress"])
+
+        # Test OUTGOING ERC20 from standalone transaction
+        standalone_outgoing_erc20 = ERC20TransferFactory(
+            address=self.token.address,
+            _from=self.safe_address,
+            to=self.external_address,
+            value=6000000000000000000,  # 6 tokens with 18 decimals
+        )
+
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(self.safe_address,)), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 6)
+        self.assertEqual(len(response.data["results"]), 6)
+
+        # Check the standalone outgoing transaction
+        result = response.json()["results"][0]
+        self.assertEqual(result["safe"], self.safe_address)
+        self.assertEqual(result["from"], self.safe_address)
+        self.assertEqual(result["to"], self.external_address)
+        self.assertEqual(result["assetType"], "erc20")
+        self.assertEqual(result["assetAddress"], self.token.address)
+        self.assertEqual(result["assetSymbol"], "TEST")
+        self.assertEqual(result["assetDecimals"], 18)
+        self.assertEqual(result["amount"], str(standalone_outgoing_erc20.value))
+        self.assertIsNotNone(result["transactionHash"])
+        self.assertIsNone(result["nonce"])
+        self.assertIsNone(result["contractAddress"])
+
+    def test_export_view_erc721_transfers(self):
+        self._setup_export_tests()
+        # Test OUTGOING ERC721 from multisig transaction
+        ethereum_tx = EthereumTxFactory()
+        multisig_tx = MultisigTransactionFactory(
+            safe=self.safe_address, ethereum_tx=ethereum_tx, trusted=True
+        )
+        ERC721TransferFactory(
+            ethereum_tx=ethereum_tx,
+            address=self.nft_token.address,
+            _from=self.safe_address,
+            to=self.external_address,
+            token_id=123,
+        )
+
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(self.safe_address,)), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(len(response.data["results"]), 1)
+
+        result = response.json()["results"][0]
+        self.assertEqual(result["safe"], self.safe_address)
+        self.assertEqual(result["from"], self.safe_address)
+        self.assertEqual(result["to"], self.external_address)
+        self.assertEqual(result["assetType"], "erc721")
+        self.assertEqual(result["assetAddress"], self.nft_token.address)
+        self.assertEqual(result["assetSymbol"], "NFT")
+        self.assertIsNone(result["assetDecimals"])
+        self.assertEqual(result["amount"], "1")
+        self.assertEqual(result["nonce"], str(multisig_tx.nonce))
+        self.assertIsNotNone(result["transactionHash"])
+
+        # Test INCOMING ERC721 from the same Safe
+        ethereum_tx = EthereumTxFactory()
+        multisig_tx = MultisigTransactionFactory(
+            safe=self.safe_address, ethereum_tx=ethereum_tx, trusted=True
+        )
+        ERC721TransferFactory(
+            ethereum_tx=ethereum_tx,
+            address=self.nft_token.address,
+            _from=self.safe_address,
+            to=self.safe_address,
+            token_id=456,
+        )
+
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(self.safe_address,)), format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 2)
+        self.assertEqual(len(response.data["results"]), 2)
+
+        # Check the incoming transaction (should be first in results due to ordering)
+        result = response.json()["results"][0]
+        self.assertEqual(result["safe"], self.safe_address)
+        self.assertEqual(result["from"], self.safe_address)
+        self.assertEqual(result["to"], self.safe_address)
+        self.assertEqual(result["assetType"], "erc721")
+        self.assertEqual(result["assetAddress"], self.nft_token.address)
+        self.assertEqual(result["assetSymbol"], "NFT")
+        self.assertIsNone(result["assetDecimals"])
+        self.assertEqual(result["amount"], "1")
+        self.assertEqual(result["nonce"], str(multisig_tx.nonce))
+        self.assertIsNotNone(result["transactionHash"])
+
+        # Test OUTGOING ERC721 from module transaction
+        ethereum_tx_module_out = EthereumTxFactory()
+        module_contract_address = Account.create().address
+        module_internal_tx_out = InternalTxFactory(
+            ethereum_tx=ethereum_tx_module_out, _from=self.safe_address, value=0
+        )
+        ModuleTransactionFactory(
+            internal_tx=module_internal_tx_out,
+            safe=self.safe_address,
+            to=module_contract_address,
+        )
+        ERC721TransferFactory(
+            ethereum_tx=ethereum_tx_module_out,
+            address=self.nft_token.address,
+            _from=self.safe_address,
+            to=self.external_address,
+            token_id=789,
+        )
+
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(self.safe_address,)), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 3)
+        self.assertEqual(len(response.data["results"]), 3)
+
+        # Check the module outgoing transaction
+        result = response.json()["results"][0]
+        self.assertEqual(result["safe"], self.safe_address)
+        self.assertEqual(result["from"], self.safe_address)
+        self.assertEqual(result["to"], self.external_address)
+        self.assertEqual(result["assetType"], "erc721")
+        self.assertEqual(result["assetAddress"], self.nft_token.address)
+        self.assertEqual(result["assetSymbol"], "NFT")
+        self.assertIsNone(result["assetDecimals"])
+        self.assertEqual(result["amount"], "1")
+        self.assertIsNone(result["nonce"])
+        self.assertIsNotNone(result["transactionHash"])
+        self.assertEqual(result["contractAddress"], module_contract_address)
+
+        # Test INCOMING ERC721 from module transaction
+        ethereum_tx_module_in = EthereumTxFactory()
+        module_internal_tx_in = InternalTxFactory(
+            ethereum_tx=ethereum_tx_module_in, _from=self.safe_address, value=0
+        )
+        ModuleTransactionFactory(
+            internal_tx=module_internal_tx_in,
+            safe=self.safe_address,
+            to=module_contract_address,
+        )
+        ERC721TransferFactory(
+            ethereum_tx=ethereum_tx_module_in,
+            address=self.nft_token.address,
+            _from=self.external_address,
+            to=self.safe_address,
+            token_id=101112,
+        )
+
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(self.safe_address,)), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 4)
+        self.assertEqual(len(response.data["results"]), 4)
+
+        # Check the module incoming transaction
+        result = response.json()["results"][0]
+        self.assertEqual(result["safe"], self.safe_address)
+        self.assertEqual(result["from"], self.external_address)
+        self.assertEqual(result["to"], self.safe_address)
+        self.assertEqual(result["assetType"], "erc721")
+        self.assertEqual(result["assetAddress"], self.nft_token.address)
+        self.assertEqual(result["assetSymbol"], "NFT")
+        self.assertIsNone(result["assetDecimals"])
+        self.assertEqual(result["amount"], "1")
+        self.assertIsNone(result["nonce"])
+        self.assertIsNotNone(result["transactionHash"])
+        self.assertEqual(result["contractAddress"], module_contract_address)
+
+        # Test INCOMING ERC721 from standalone transaction
+        ERC721TransferFactory(
+            address=self.nft_token.address,
+            _from=self.external_address,
+            to=self.safe_address,
+            token_id=131415,
+        )
+
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(self.safe_address,)), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 5)
+        self.assertEqual(len(response.data["results"]), 5)
+
+        # Check the standalone incoming transaction
+        result = response.json()["results"][0]
+        self.assertEqual(result["safe"], self.safe_address)
+        self.assertEqual(result["from"], self.external_address)
+        self.assertEqual(result["to"], self.safe_address)
+        self.assertEqual(result["assetType"], "erc721")
+        self.assertEqual(result["assetAddress"], self.nft_token.address)
+        self.assertEqual(result["assetSymbol"], "NFT")
+        self.assertIsNone(result["assetDecimals"])
+        self.assertEqual(result["amount"], "1")
+        self.assertIsNone(result["nonce"])
+        self.assertIsNotNone(result["transactionHash"])
+        self.assertIsNone(result["contractAddress"])
+
+        # Test OUTGOING ERC721 from standalone transaction
+        ERC721TransferFactory(
+            address=self.nft_token.address,
+            _from=self.safe_address,
+            to=self.external_address,
+            token_id=161718,
+        )
+
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(self.safe_address,)), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 6)
+        self.assertEqual(len(response.data["results"]), 6)
+
+        # Check the standalone outgoing transaction
+        result = response.json()["results"][0]
+        self.assertEqual(result["safe"], self.safe_address)
+        self.assertEqual(result["from"], self.safe_address)
+        self.assertEqual(result["to"], self.external_address)
+        self.assertEqual(result["assetType"], "erc721")
+        self.assertEqual(result["assetAddress"], self.nft_token.address)
+        self.assertEqual(result["assetSymbol"], "NFT")
+        self.assertIsNone(result["assetDecimals"])
+        self.assertEqual(result["amount"], "1")
+        self.assertIsNone(result["nonce"])
+        self.assertIsNotNone(result["transactionHash"])
+        self.assertIsNone(result["contractAddress"])
+
+    def test_export_view_ether_transfers(self):
+        self._setup_export_tests()
+        # Test OUTGOING Ether from multisig transaction
+        ethereum_tx_multisig_out = EthereumTxFactory()
+        value = 1000000000000000000  # 1 ETH
+        multisig_tx_out = MultisigTransactionFactory(
+            safe=self.safe_address,
+            ethereum_tx=ethereum_tx_multisig_out,
+            trusted=True,
+            to=self.external_address,
+            value=value,
+        )
+        multisig_outgoing_internal_tx = InternalTxFactory(
+            ethereum_tx=ethereum_tx_multisig_out,
+            _from=self.safe_address,
+            to=self.external_address,
+            value=value,
+        )
+
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(self.safe_address,)), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(len(response.data["results"]), 1)
+
+        result = response.json()["results"][0]
+        self.assertEqual(result["safe"], self.safe_address)
+        self.assertEqual(result["from"], self.safe_address)
+        self.assertEqual(result["to"], self.external_address)
+        self.assertEqual(result["assetType"], "native")
+        self.assertIsNone(result["assetAddress"])
+        self.assertEqual(result["assetSymbol"], "ETH")
+        self.assertEqual(result["assetDecimals"], 18)
+        self.assertEqual(result["amount"], str(multisig_outgoing_internal_tx.value))
+        self.assertEqual(result["nonce"], str(multisig_tx_out.nonce))
+        self.assertIsNotNone(result["transactionHash"])
+
+        # Test INCOMING Ether from multisig transaction
+        ethereum_tx_multisig_in = EthereumTxFactory()
+        value = 2000000000000000000
+        # Multisigtransaction from external Safe
+        MultisigTransactionFactory(
+            safe=self.external_address,
+            ethereum_tx=ethereum_tx_multisig_in,
+            trusted=True,
+            value=value,
+            to=self.safe_address,
+        )
+        multisig_incoming_internal_tx = InternalTxFactory(
+            ethereum_tx=ethereum_tx_multisig_in,
+            _from=self.external_address,
+            to=self.safe_address,
+            value=value,  # 2 ETH
+        )
+
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(self.safe_address,)), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 2)
+        self.assertEqual(len(response.data["results"]), 2)
+
+        # Check the incoming transaction (should be first in results due to ordering)
+        result = response.json()["results"][0]
+        self.assertEqual(result["safe"], self.safe_address)
+        self.assertEqual(result["from"], self.external_address)
+        self.assertEqual(result["to"], self.safe_address)
+        self.assertEqual(result["assetType"], "native")
+        self.assertIsNone(result["assetAddress"])
+        self.assertEqual(result["assetSymbol"], "ETH")
+        self.assertEqual(result["assetDecimals"], 18)
+        self.assertEqual(result["amount"], str(multisig_incoming_internal_tx.value))
+        self.assertIsNone(result["nonce"])
+        self.assertIsNotNone(result["transactionHash"])
+
+        # Test OUTGOING Ether from module transaction
+        ethereum_tx_module_out = EthereumTxFactory()
+        module_contract_address = Account.create().address
+        module_internal_tx_out = InternalTxFactory(
+            ethereum_tx=ethereum_tx_module_out,
+            _from=self.safe_address,
+            to=self.external_address,
+            value=3000000000000000000,
+        )
+        ModuleTransactionFactory(
+            internal_tx=module_internal_tx_out,
+            safe=self.safe_address,
+            to=module_contract_address,
+        )
+
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(self.safe_address,)), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 3)
+        self.assertEqual(len(response.data["results"]), 3)
+
+        # Check the module outgoing transaction
+        result = response.json()["results"][0]
+        self.assertEqual(result["safe"], self.safe_address)
+        self.assertEqual(result["from"], self.safe_address)
+        self.assertEqual(result["to"], self.external_address)
+        self.assertEqual(result["assetType"], "native")
+        self.assertIsNone(result["assetAddress"])
+        self.assertEqual(result["assetSymbol"], "ETH")
+        self.assertEqual(result["assetDecimals"], 18)
+        self.assertEqual(result["amount"], str(module_internal_tx_out.value))
+        self.assertIsNotNone(result["transactionHash"])
+        self.assertIsNone(result["nonce"])
+        self.assertEqual(result["contractAddress"], module_contract_address)
+
+        # Test INCOMING Ether from module transaction
+        ethereum_tx_module_in = EthereumTxFactory()
+        module_internal_tx_in = InternalTxFactory(
+            ethereum_tx=ethereum_tx_module_in,
+            _from=self.external_address,
+            to=self.safe_address,
+            value=4000000000000000000,  # 4 ETH
+        )
+        ModuleTransactionFactory(
+            internal_tx=module_internal_tx_in,
+            safe=self.safe_address,
+            to=module_contract_address,
+        )
+
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(self.safe_address,)), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 4)
+        self.assertEqual(len(response.data["results"]), 4)
+
+        # Check the module incoming transaction
+        result = response.json()["results"][0]
+        self.assertEqual(result["safe"], self.safe_address)
+        self.assertEqual(result["from"], self.external_address)
+        self.assertEqual(result["to"], self.safe_address)
+        self.assertEqual(result["assetType"], "native")
+        self.assertIsNone(result["assetAddress"])
+        self.assertEqual(result["assetSymbol"], "ETH")
+        self.assertEqual(result["assetDecimals"], 18)
+        self.assertEqual(result["amount"], str(module_internal_tx_in.value))
+        self.assertIsNotNone(result["transactionHash"])
+        self.assertIsNone(result["nonce"])
+        self.assertEqual(result["contractAddress"], module_contract_address)
+
+        # Test INCOMING Ether from standalone transaction
+        standalone_incoming_internal_tx = InternalTxFactory(
+            _from=self.external_address,
+            to=self.safe_address,
+            value=5000000000000000000,  # 5 ETH
+        )
+
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(self.safe_address,)), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 5)
+        self.assertEqual(len(response.data["results"]), 5)
+
+        # Check the standalone incoming transaction
+        result = response.json()["results"][0]
+        self.assertEqual(result["safe"], self.safe_address)
+        self.assertEqual(result["from"], self.external_address)
+        self.assertEqual(result["to"], self.safe_address)
+        self.assertEqual(result["assetType"], "native")
+        self.assertIsNone(result["assetAddress"])
+        self.assertEqual(result["assetSymbol"], "ETH")
+        self.assertEqual(result["assetDecimals"], 18)
+        self.assertEqual(result["amount"], str(standalone_incoming_internal_tx.value))
+        self.assertIsNotNone(result["transactionHash"])
+        self.assertIsNone(result["nonce"])
+        self.assertIsNone(result["contractAddress"])
+
+    def test_export_view_should_not_include_no_transfer_transactions(self):
+        self._setup_export_tests()
+
+        ethereum_tx_multisig = EthereumTxFactory()
+        MultisigTransactionFactory(
+            safe=self.safe_address,
+            ethereum_tx=ethereum_tx_multisig,
+            trusted=True,
+            to=self.external_address,
+            value=0,
+        )
+        InternalTxFactory(
+            ethereum_tx=ethereum_tx_multisig,
+            _from=self.safe_address,
+            to=self.external_address,
+            value=0,
+        )
+
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(self.safe_address,)), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 0)
+        self.assertEqual(len(response.data["results"]), 0)
+
+        ethereum_tx_multisig = EthereumTxFactory()
+        internal_tx = InternalTxFactory(
+            ethereum_tx=ethereum_tx_multisig,
+            _from=self.safe_address,
+            to=self.external_address,
+            value=0,
+        )
+        ModuleTransactionFactory(
+            internal_tx=internal_tx,
+            safe=self.safe_address,
+            to=Account.create().address,
+        )
+
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(self.safe_address,)), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 0)
+        self.assertEqual(len(response.data["results"]), 0)
+
+    def test_export_view_priority_deduplication(self):
+        """
+        Test that the export view correctly prioritizes transaction types:
+        1. Module transactions (highest priority)
+        2. Multisig transactions
+        3. Standalone transfers (lowest priority)
+
+        This validates the ROW_NUMBER() OVER approach that replaced DISTINCT ON.
+        """
+        self._setup_export_tests()
+
+        # Create a single ethereum transaction with multiple transaction types
+        # This scenario creates potential duplicates that need proper prioritization
+        ethereum_tx = EthereumTxFactory()
+
+        # Create multisig transaction
+        MultisigTransactionFactory(
+            safe=self.safe_address,
+            ethereum_tx=ethereum_tx,
+            trusted=True,
+            to=self.external_address,
+            value=1000000000000000000,  # 1 ETH
+        )
+
+        # Create module transaction (higher priority)
+        module_internal_tx = InternalTxFactory(
+            ethereum_tx=ethereum_tx,
+            _from=self.safe_address,
+            to=self.external_address,
+            value=1000000000000000000,  # 1 ETH
+            trace_address="0",  # Root trace
+        )
+        ModuleTransactionFactory(
+            internal_tx=module_internal_tx,
+            safe=self.safe_address,
+            to=self.external_address,
+        )
+
+        # Create ERC20 transfer associated with the same transaction
+        erc20_transfer = ERC20TransferFactory(
+            ethereum_tx=ethereum_tx,
+            address=self.token.address,
+            _from=self.safe_address,
+            to=self.external_address,
+            value=5000000000000000000,  # 5 tokens
+        )
+
+        # Create ETH internal transfer
+        InternalTxFactory(
+            ethereum_tx=ethereum_tx,
+            _from=self.safe_address,
+            to=self.external_address,
+            value=1000000000000000000,
+            trace_address="1",  # Different trace address
+        )
+
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(self.safe_address,)), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        # Should have exactly 3 results: 1 ERC20 transfer + 2 ETH transfers (different trace_address)
+        self.assertEqual(response.data["count"], 3)
+        self.assertEqual(len(response.data["results"]), 3)
+
+        results = response.json()["results"]
+
+        # Find the ERC20 result
+        erc20_result = next(r for r in results if r["assetType"] == "erc20")
+
+        # The ERC20 transfer should prioritize module transaction data
+        # Module transactions should be prioritized over multisig transactions
+        self.assertEqual(erc20_result["safe"], self.safe_address)
+        self.assertEqual(erc20_result["from"], self.safe_address)
+        self.assertEqual(erc20_result["to"], self.external_address)
+        self.assertEqual(erc20_result["assetType"], "erc20")
+        self.assertEqual(erc20_result["assetAddress"], self.token.address)
+        self.assertEqual(erc20_result["amount"], str(erc20_transfer.value))
+        self.assertEqual(erc20_result["transactionHash"], ethereum_tx.tx_hash)
+        # Should have multisig safe_tx_hash since module transactions don't have safe_tx_hash
+
+        # Find the ETH results (should be 2 - different trace addresses)
+        eth_results = [r for r in results if r["assetType"] == "native"]
+        self.assertEqual(len(eth_results), 2)
+
+        # Both ETH transfers should show module transaction context (highest priority)
+        for eth_result in eth_results:
+            self.assertEqual(eth_result["safe"], self.safe_address)
+            self.assertEqual(eth_result["from"], self.safe_address)
+            self.assertEqual(eth_result["to"], self.external_address)
+            self.assertEqual(eth_result["assetType"], "native")
+            self.assertEqual(eth_result["assetSymbol"], "ETH")
+            self.assertEqual(
+                eth_result["amount"], "1000000000000000000"
+            )  # 1 ETH for both
+            self.assertEqual(eth_result["transactionHash"], ethereum_tx.tx_hash)
+            # Should have multisig safe_tx_hash
+
+        # Verify the partition keys work correctly - different log_index/trace_address means separate results
+        self.assertEqual(len(results), 3)  # No inappropriate deduplication
+
+    def test_export_view_standalone_transfer_priority(self):
+        """
+        Test that standalone transfers (no multisig/module) work correctly.
+        This validates the priority logic handles the "ELSE 3" case.
+        """
+        self._setup_export_tests()
+
+        # Create standalone ethereum transaction (no multisig or module)
+        ethereum_tx = EthereumTxFactory()
+
+        # Create ERC20 transfer without any multisig or module transaction
+        erc20_transfer = ERC20TransferFactory(
+            ethereum_tx=ethereum_tx,
+            address=self.token.address,
+            _from=self.external_address,  # External sender
+            to=self.safe_address,  # Safe receiver
+            value=3000000000000000000,  # 3 tokens
+        )
+
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(self.safe_address,)), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(len(response.data["results"]), 1)
+
+        result = response.json()["results"][0]
+
+        # Should be standalone transfer (priority 3)
+        self.assertEqual(result["safe"], self.safe_address)
+        self.assertEqual(result["from"], self.external_address)
+        self.assertEqual(result["to"], self.safe_address)
+        self.assertEqual(result["assetType"], "erc20")
+        self.assertEqual(result["amount"], str(erc20_transfer.value))
+        self.assertEqual(result["transactionHash"], ethereum_tx.tx_hash)
+        # Standalone transfers should not have safe_tx_hash

@@ -1,3 +1,4 @@
+import datetime
 import logging
 from datetime import timedelta
 from unittest import mock
@@ -9,10 +10,10 @@ from django.test import TestCase
 from django.utils import timezone
 
 from eth_account import Account
+from safe_eth.eth.utils import fast_keccak_text
+from safe_eth.safe.safe_signature import SafeSignatureType
 
-from gnosis.eth.utils import fast_keccak_text
-from gnosis.safe.safe_signature import SafeSignatureType
-
+from safe_transaction_service.account_abstraction.tests.mocks import aa_tx_receipt_mock
 from safe_transaction_service.contracts.models import ContractQuerySet
 from safe_transaction_service.contracts.tests.factories import ContractFactory
 
@@ -29,12 +30,13 @@ from ..models import (
     InternalTxDecoded,
     MultisigConfirmation,
     MultisigTransaction,
+    SafeContract,
     SafeContractDelegate,
     SafeLastStatus,
     SafeMasterCopy,
     SafeStatus,
-    WebHook,
 )
+from ..utils import clean_receipt_log
 from .factories import (
     ERC20TransferFactory,
     ERC721TransferFactory,
@@ -50,10 +52,10 @@ from .factories import (
     SafeLastStatusFactory,
     SafeMasterCopyFactory,
     SafeStatusFactory,
-    WebHookFactory,
 )
 from .mocks.mocks_ethereum_tx import type_0_tx, type_2_tx
 from .mocks.mocks_internal_tx_indexer import block_result
+from .mocks.mocks_safe_creation import multiple_safes_same_tx_creation_mock
 
 logger = logging.getLogger(__name__)
 
@@ -213,7 +215,7 @@ class TestMultisigTransaction(TestCase):
         self.assertEqual(multisig_transaction.owners, [])
 
         account = Account.create()
-        multisig_transaction.signatures = account.signHash(
+        multisig_transaction.signatures = account.unsafe_sign_hash(
             multisig_transaction.safe_tx_hash
         )["signature"]
         multisig_transaction.save()
@@ -328,23 +330,9 @@ class TestEthereumTx(TestCase):
     def test_create_from_tx_dict(self):
         for tx_mock in (type_0_tx, type_2_tx):
             with self.subTest(tx_mock=tx_mock):
+                EthereumBlockFactory(number=tx_mock["tx"]["blockNumber"])
                 tx_dict = tx_mock["tx"]
-                ethereum_tx = EthereumTx.objects.create_from_tx_dict(tx_dict)
-                self.assertEqual(ethereum_tx.type, tx_dict["type"], 0)
-                self.assertEqual(ethereum_tx.gas_price, tx_dict["gasPrice"])
-                self.assertEqual(
-                    ethereum_tx.max_fee_per_gas, tx_dict.get("maxFeePerGas")
-                )
-                self.assertEqual(
-                    ethereum_tx.max_priority_fee_per_gas,
-                    tx_dict.get("maxPriorityFeePerGas"),
-                )
-                self.assertIsNone(ethereum_tx.gas_used)
-                self.assertIsNone(ethereum_tx.status)
-                self.assertIsNone(ethereum_tx.transaction_index)
-
                 tx_receipt = tx_mock["receipt"]
-                ethereum_tx.delete()
                 ethereum_tx = EthereumTx.objects.create_from_tx_dict(
                     tx_dict, tx_receipt=tx_receipt
                 )
@@ -362,8 +350,55 @@ class TestEthereumTx(TestCase):
                     ethereum_tx.transaction_index, tx_receipt["transactionIndex"]
                 )
 
+    def test_account_abstraction_tx_hashes(self):
+        self.assertEqual(len(EthereumTx.objects.account_abstraction_txs()), 0)
+
+        # Insert random transaction
+        EthereumTxFactory()
+        self.assertEqual(len(EthereumTx.objects.account_abstraction_txs()), 0)
+
+        # Insert a 4337 transaction
+        ethereum_tx = EthereumTxFactory(
+            logs=[clean_receipt_log(log) for log in aa_tx_receipt_mock["logs"]]
+        )
+        ethereum_txs = EthereumTx.objects.account_abstraction_txs()
+        self.assertEqual(len(ethereum_txs), 1)
+        self.assertEqual(ethereum_txs[0], ethereum_tx)
+
+    def test_get_deployed_proxies_from_logs(self):
+        ethereum_tx = EthereumTxFactory(
+            logs=[
+                clean_receipt_log(log)
+                for log in multiple_safes_same_tx_creation_mock["tx_logs"]
+            ]
+        )
+        self.assertEqual(
+            ethereum_tx.get_deployed_proxies_from_logs(),
+            multiple_safes_same_tx_creation_mock["proxies_deployed"],
+        )
+
 
 class TestTokenTransfer(TestCase):
+    def test_fast_count(self):
+        address = Account.create().address
+
+        self.assertEqual(ERC20Transfer.objects.fast_count(address), 0)
+
+        ERC20TransferFactory(to=address)
+        self.assertEqual(ERC20Transfer.objects.fast_count(address), 1)
+
+        ERC20TransferFactory(_from=address)
+        self.assertEqual(ERC20Transfer.objects.fast_count(address), 2)
+
+        # Optimization uses a UNION, so it counts transfers with `from=to` twice
+        ERC20TransferFactory(_from=address, to=address)
+        self.assertEqual(ERC20Transfer.objects.fast_count(address), 4)
+
+        # Random transfers shouldn't increase the count for that address
+        for _ in range(10):
+            ERC20TransferFactory()
+        self.assertEqual(ERC20Transfer.objects.fast_count(address), 4)
+
     def test_transfer_to_erc721(self):
         erc20_transfer = ERC20TransferFactory()
         self.assertEqual(ERC721Transfer.objects.count(), 0)
@@ -395,9 +430,9 @@ class TestTokenTransfer(TestCase):
         ERC20TransferFactory()  # This event should not appear
         self.assertEqual(ERC20Transfer.objects.to_or_from(safe_address).count(), 2)
 
-        self.assertSetEqual(
+        self.assertCountEqual(
             ERC20Transfer.objects.tokens_used_by_address(safe_address),
-            {e1.address, e2.address},
+            [e1.address, e2.address],
         )
 
     def test_erc721_events(self):
@@ -407,9 +442,9 @@ class TestTokenTransfer(TestCase):
         ERC721TransferFactory()  # This event should not appear
         self.assertEqual(ERC721Transfer.objects.to_or_from(safe_address).count(), 2)
 
-        self.assertSetEqual(
+        self.assertCountEqual(
             ERC721Transfer.objects.tokens_used_by_address(safe_address),
-            {e1.address, e2.address},
+            [e1.address, e2.address],
         )
 
     def test_incoming_tokens(self):
@@ -472,7 +507,7 @@ class TestTokenTransfer(TestCase):
             ERC721Transfer.objects.erc721_owned_by(address=random_address), []
         )
         erc721_transfer = ERC721TransferFactory(to=random_address)
-        erc721_transfer_2 = ERC721TransferFactory(to=random_address)
+        ERC721TransferFactory(to=random_address)
         token = TokenFactory(address=erc721_transfer.address, spam=True)
         self.assertEqual(
             len(ERC721Transfer.objects.erc721_owned_by(address=random_address)), 2
@@ -514,11 +549,11 @@ class TestInternalTx(TestCase):
         self.assertFalse(txs)
 
         ether_value = 5
-        internal_tx = InternalTxFactory(to=ethereum_address, value=ether_value)
+        InternalTxFactory(to=ethereum_address, value=ether_value)
         InternalTxFactory(value=ether_value)  # Create tx with a random address too
         txs = InternalTx.objects.ether_and_token_txs(ethereum_address)
         self.assertEqual(txs.count(), 1)
-        internal_tx = InternalTxFactory(_from=ethereum_address, value=ether_value)
+        InternalTxFactory(_from=ethereum_address, value=ether_value)
         self.assertEqual(txs.count(), 2)
 
         token_value = 10
@@ -529,12 +564,12 @@ class TestInternalTx(TestCase):
         ERC20TransferFactory(_from=ethereum_address, value=token_value)
         self.assertEqual(txs.count(), 4)
 
-        for i, tx in enumerate(txs):
+        self.assertEqual(len(txs), 4)
+        for tx in txs:
             if tx["token_address"]:
                 self.assertEqual(tx["_value"], token_value)
             else:
                 self.assertEqual(tx["_value"], ether_value)
-        self.assertEqual(i, 3)
 
         self.assertEqual(InternalTx.objects.ether_txs().count(), 3)
         self.assertEqual(InternalTx.objects.token_txs().count(), 3)
@@ -624,7 +659,10 @@ class TestInternalTx(TestCase):
         self.assertEqual(InternalTx.objects.can_be_decoded().count(), 1)
 
         InternalTxDecoded.objects.create(
-            function_name="alo", arguments={}, internal_tx=internal_tx
+            function_name="alo",
+            arguments={},
+            internal_tx=internal_tx,
+            safe_address=internal_tx._from,
         )
         self.assertEqual(InternalTx.objects.can_be_decoded().count(), 0)
 
@@ -669,7 +707,7 @@ class TestInternalTx(TestCase):
 
 class TestInternalTxDecoded(TestCase):
     def test_order_by_processing_queue(self):
-        self.assertQuerysetEqual(
+        self.assertQuerySetEqual(
             InternalTxDecoded.objects.order_by_processing_queue(), []
         )
         ethereum_tx = EthereumTxFactory()
@@ -684,14 +722,14 @@ class TestInternalTxDecoded(TestCase):
             internal_tx__trace_address="15", internal_tx__ethereum_tx=ethereum_tx
         )
 
-        self.assertQuerysetEqual(
+        self.assertQuerySetEqual(
             InternalTxDecoded.objects.order_by_processing_queue(),
             [internal_tx_decoded_0, internal_tx_decoded_1, internal_tx_decoded_15],
         )
 
         internal_tx_decoded_15.function_name = "setup"
         internal_tx_decoded_15.save()
-        self.assertQuerysetEqual(
+        self.assertQuerySetEqual(
             InternalTxDecoded.objects.order_by_processing_queue(),
             [internal_tx_decoded_15, internal_tx_decoded_0, internal_tx_decoded_1],
         )
@@ -748,7 +786,11 @@ class TestInternalTxDecoded(TestCase):
         self.assertFalse(InternalTxDecoded.objects.out_of_order_for_safe(random_safe))
 
         InternalTxDecodedFactory(
-            internal_tx___from=random_safe, internal_tx__block_number=9, processed=False
+            internal_tx___from=random_safe,
+            internal_tx__block_number=9,
+            processed=False,
+            internal_tx__timestamp=i.internal_tx.timestamp
+            - datetime.timedelta(seconds=1),
         )
         self.assertTrue(InternalTxDecoded.objects.out_of_order_for_safe(random_safe))
         i.processed = False
@@ -757,17 +799,28 @@ class TestInternalTxDecoded(TestCase):
         self.assertFalse(InternalTxDecoded.objects.out_of_order_for_safe(random_safe))
 
         InternalTxDecodedFactory(
-            internal_tx___from=random_safe, internal_tx__block_number=8, processed=True
+            internal_tx___from=random_safe,
+            internal_tx__block_number=8,
+            processed=True,
+            internal_tx__timestamp=i.internal_tx.timestamp
+            - datetime.timedelta(seconds=2),
         )
         self.assertFalse(InternalTxDecoded.objects.out_of_order_for_safe(random_safe))
 
         InternalTxDecodedFactory(
-            internal_tx___from=random_safe, internal_tx__block_number=9, processed=True
+            internal_tx___from=random_safe,
+            internal_tx__block_number=9,
+            processed=True,
+            internal_tx__timestamp=i.internal_tx.timestamp
+            - datetime.timedelta(seconds=1),
         )
         self.assertFalse(InternalTxDecoded.objects.out_of_order_for_safe(random_safe))
 
         InternalTxDecodedFactory(
-            internal_tx___from=random_safe, internal_tx__block_number=10, processed=True
+            internal_tx___from=random_safe,
+            internal_tx__block_number=10,
+            processed=True,
+            internal_tx__timestamp=i.internal_tx.timestamp,
         )
         self.assertTrue(InternalTxDecoded.objects.out_of_order_for_safe(random_safe))
 
@@ -1000,6 +1053,45 @@ class TestSafeStatus(TestCase):
         self.assertEqual(safe_status_5.previous(), safe_status_2)
 
 
+class TestSafeContract(TestCase):
+    def test_get_minimum_creation_block_number(self):
+        address_1 = Account.create().address
+        address_2 = Account.create().address
+        self.assertIsNone(
+            SafeContract.objects.get_minimum_creation_block_number(
+                [address_1, address_2]
+            )
+        )
+
+        block_number_1 = 15
+        block_number_2 = 16
+        SafeContractFactory(
+            address=address_1, ethereum_tx__block__number=block_number_1
+        )
+        SafeContractFactory(
+            address=address_2, ethereum_tx__block__number=block_number_2
+        )
+
+        self.assertEqual(
+            SafeContract.objects.get_minimum_creation_block_number(
+                [address_1, address_2]
+            ),
+            block_number_1,
+        )
+
+        address_3 = Account.create().address
+        block_number_3 = 8
+        SafeContractFactory(
+            address=address_3, ethereum_tx__block__number=block_number_3
+        )
+        self.assertEqual(
+            SafeContract.objects.get_minimum_creation_block_number(
+                [address_1, address_2, address_3]
+            ),
+            block_number_3,
+        )
+
+
 class TestSafeContractDelegate(TestCase):
     def test_get_for_safe(self):
         random_safe = Account.create().address
@@ -1065,6 +1157,31 @@ class TestSafeContractDelegate(TestCase):
                 ],
             ),
             [safe_contract_delegate_another_safe, safe_contract_delegate_without_safe],
+        )
+
+        # Check expired delegate
+        safe_contract_delegate_expired = SafeContractDelegateFactory(
+            expiry_date=timezone.now() - datetime.timedelta(hours=1)
+        )
+        safe_contract_delegate_not_expired = SafeContractDelegateFactory(
+            safe_contract=safe_contract_delegate_expired.safe_contract
+        )
+        safe_contract_delegate_not_expired_2 = SafeContractDelegateFactory(
+            safe_contract=safe_contract_delegate_expired.safe_contract
+        )
+        expired_delegate_safe_address = (
+            safe_contract_delegate_expired.safe_contract.address
+        )
+        self.assertCountEqual(
+            SafeContractDelegate.objects.get_for_safe(
+                expired_delegate_safe_address,
+                [
+                    safe_contract_delegate_expired.delegator,
+                    safe_contract_delegate_not_expired.delegator,
+                    safe_contract_delegate_not_expired_2.delegator,
+                ],
+            ),
+            [safe_contract_delegate_not_expired, safe_contract_delegate_not_expired_2],
         )
 
     def test_get_for_safe_and_delegate(self):
@@ -1168,12 +1285,51 @@ class TestSafeContractDelegate(TestCase):
             set(),
         )
 
+    def test_remove_delegates_for_owner_in_safe(self):
+        safe_address = Account.create().address
+        owner = Account.create().address
+        self.assertCountEqual(
+            SafeContractDelegate.objects.get_for_safe(None, [owner]), []
+        )
+
+        safe_contract_delegate = SafeContractDelegateFactory(
+            delegator=owner, safe_contract=None
+        )
+        self.assertEqual(
+            SafeContractDelegate.objects.get_delegates_for_safe_and_owners(
+                Account.create().address, [owner]
+            ),
+            {safe_contract_delegate.delegate},
+        )
+
+        safe_specific_delegate = SafeContractDelegateFactory(
+            delegator=owner, safe_contract__address=safe_address
+        )
+
+        self.assertEqual(
+            SafeContractDelegate.objects.get_delegates_for_safe_and_owners(
+                safe_address, [owner]
+            ),
+            {safe_contract_delegate.delegate, safe_specific_delegate.delegate},
+        )
+
+        SafeContractDelegate.objects.remove_delegates_for_owner_in_safe(
+            safe_address, owner
+        )
+
+        self.assertEqual(
+            SafeContractDelegate.objects.get_delegates_for_safe_and_owners(
+                safe_address, [owner]
+            ),
+            {safe_contract_delegate.delegate},
+        )
+
 
 class TestMultisigConfirmations(TestCase):
     def test_remove_unused_confirmations(self):
         safe_address = Account.create().address
         owner_address = Account.create().address
-        multisig_confirmation = MultisigConfirmationFactory(
+        MultisigConfirmationFactory(
             owner=owner_address,
             multisig_transaction__nonce=0,
             multisig_transaction__ethereum_tx=None,
@@ -1188,7 +1344,7 @@ class TestMultisigConfirmations(TestCase):
         self.assertEqual(MultisigConfirmation.objects.count(), 0)
 
         # With an executed multisig transaction it shouldn't delete the confirmation
-        multisig_confirmation = MultisigConfirmationFactory(
+        MultisigConfirmationFactory(
             owner=owner_address,
             multisig_transaction__nonce=0,
             multisig_transaction__safe=safe_address,
@@ -1202,30 +1358,30 @@ class TestMultisigConfirmations(TestCase):
         self.assertEqual(MultisigConfirmation.objects.all().delete()[0], 1)
 
         # More testing
-        multisig_confirmation = MultisigConfirmationFactory(
+        MultisigConfirmationFactory(
             owner=owner_address,
             multisig_transaction__nonce=0,
             multisig_transaction__safe=safe_address,
         )
-        multisig_confirmation = MultisigConfirmationFactory(
+        MultisigConfirmationFactory(
             owner=owner_address,
             multisig_transaction__nonce=0,
             multisig_transaction__ethereum_tx=None,
             multisig_transaction__safe=safe_address,
         )
-        multisig_confirmation = MultisigConfirmationFactory(
+        MultisigConfirmationFactory(
             owner=owner_address,
             multisig_transaction__nonce=1,
             multisig_transaction__ethereum_tx=None,
             multisig_transaction__safe=safe_address,
         )
-        multisig_confirmation = MultisigConfirmationFactory(
+        MultisigConfirmationFactory(
             owner=owner_address,
             multisig_transaction__nonce=1,
             multisig_transaction__ethereum_tx=None,
             multisig_transaction__safe=safe_address,
         )
-        multisig_confirmation = MultisigConfirmationFactory(
+        MultisigConfirmationFactory(
             owner=owner_address,
             multisig_transaction__nonce=1,
             multisig_transaction__ethereum_tx=None,
@@ -1241,26 +1397,26 @@ class TestMultisigConfirmations(TestCase):
 
 
 class TestEthereumBlock(TestCase):
-    def test_get_or_create_from_block(self):
+    def test_get_or_create_from_block_dict(self):
         mock_block = block_result[0]
         self.assertEqual(EthereumBlock.objects.count(), 0)
-        db_block = EthereumBlock.objects.get_or_create_from_block(mock_block)
+        db_block = EthereumBlock.objects.get_or_create_from_block_dict(mock_block)
         db_block.set_confirmed()
         self.assertEqual(db_block.confirmed, True)
         self.assertEqual(EthereumBlock.objects.count(), 1)
         with mock.patch.object(
-            EthereumBlockManager, "create_from_block"
-        ) as create_from_block_mock:
+            EthereumBlockManager, "create_from_block_dict"
+        ) as create_from_block_dict_mock:
             # Block already exists
-            EthereumBlock.objects.get_or_create_from_block(mock_block)
-            create_from_block_mock.assert_not_called()
+            EthereumBlock.objects.get_or_create_from_block_dict(mock_block)
+            create_from_block_dict_mock.assert_not_called()
 
         # Test block with different block-hash but same block number
         mock_block_2 = dict(mock_block)
         mock_block_2["hash"] = fast_keccak_text("another-hash")
         self.assertNotEqual(mock_block["hash"], mock_block_2["hash"])
         with self.assertRaises(IntegrityError):
-            EthereumBlock.objects.get_or_create_from_block(mock_block_2)
+            EthereumBlock.objects.get_or_create_from_block_dict(mock_block_2)
             self.assertEqual(EthereumBlock.objects.count(), 1)
             db_block.refresh_from_db()
             self.assertEqual(db_block.confirmed, False)
@@ -1333,9 +1489,7 @@ class TestMultisigTransactions(TestCase):
         safe_address_3 = Account.create().address
         MultisigTransactionFactory(safe=safe_address_1)
         MultisigTransactionFactory(safe=safe_address_1)
-        safes_with_number_of_transactions = (
-            MultisigTransaction.objects.safes_with_number_of_transactions_executed()
-        )
+        (MultisigTransaction.objects.safes_with_number_of_transactions_executed())
         result = (
             MultisigTransaction.objects.safes_with_number_of_transactions_executed()
         )
@@ -1380,17 +1534,13 @@ class TestMultisigTransactions(TestCase):
         safe_address_3 = Account.create().address
         MultisigTransactionFactory(safe=safe_address_1)
         MultisigTransactionFactory(safe=safe_address_1)
-        result = (
-            MultisigTransaction.objects.safes_with_number_of_transactions_executed_and_master_copy()
-        )
+        result = MultisigTransaction.objects.safes_with_number_of_transactions_executed_and_master_copy()
         self.assertEqual(len(result), 1)
         self.assertEqual(
             result[0], {"safe": safe_address_1, "transactions": 2, "master_copy": None}
         )
         MultisigTransactionFactory(safe=safe_address_2)
-        result = (
-            MultisigTransaction.objects.safes_with_number_of_transactions_executed_and_master_copy()
-        )
+        result = MultisigTransaction.objects.safes_with_number_of_transactions_executed_and_master_copy()
         self.assertEqual(
             list(result),
             [
@@ -1401,9 +1551,7 @@ class TestMultisigTransactions(TestCase):
 
         safe_status_1 = SafeStatusFactory(address=safe_address_1)
         self.assertIsNotNone(safe_status_1.master_copy)
-        result = (
-            MultisigTransaction.objects.safes_with_number_of_transactions_executed_and_master_copy()
-        )
+        result = MultisigTransaction.objects.safes_with_number_of_transactions_executed_and_master_copy()
         self.assertEqual(
             list(result),
             [
@@ -1417,9 +1565,7 @@ class TestMultisigTransactions(TestCase):
         )
 
         safe_status_2 = SafeStatusFactory(address=safe_address_2)
-        result = (
-            MultisigTransaction.objects.safes_with_number_of_transactions_executed_and_master_copy()
-        )
+        result = MultisigTransaction.objects.safes_with_number_of_transactions_executed_and_master_copy()
         self.assertEqual(
             list(result),
             [
@@ -1437,9 +1583,7 @@ class TestMultisigTransactions(TestCase):
         )
 
         [MultisigTransactionFactory(safe=safe_address_3) for _ in range(4)]
-        result = (
-            MultisigTransaction.objects.safes_with_number_of_transactions_executed_and_master_copy()
-        )
+        result = MultisigTransaction.objects.safes_with_number_of_transactions_executed_and_master_copy()
         self.assertEqual(
             list(result),
             [
@@ -1484,25 +1628,57 @@ class TestMultisigTransactions(TestCase):
     def test_with_confirmations_required(self):
         # This should never be picked, Safe not matching
         SafeStatusFactory(nonce=0, threshold=4)
-
         multisig_transaction = MultisigTransactionFactory(nonce=0)
-        self.assertIsNone(
+        safe_address = multisig_transaction.safe
+
+        self.assertEqual(
             MultisigTransaction.objects.with_confirmations_required()
             .first()
-            .confirmations_required
+            .confirmations_required,
+            0,
         )
 
         # SafeStatus not matching the nonce (looking for threshold in nonce=0)
-        safe_status = SafeStatusFactory(
-            address=multisig_transaction.safe, nonce=1, threshold=8
-        )
-        self.assertIsNone(
+        safe_status = SafeStatusFactory(address=safe_address, nonce=1, threshold=8)
+        self.assertEqual(
             MultisigTransaction.objects.with_confirmations_required()
             .first()
-            .confirmations_required
+            .confirmations_required,
+            0,
         )
 
-        safe_status.nonce = 0
+        # Add confirmations. Without SafeStatus, confirmations for the transaction are used
+        number_confirmations = 5
+        for _ in range(number_confirmations):
+            MultisigConfirmationFactory(multisig_transaction=multisig_transaction)
+
+        self.assertEqual(
+            MultisigTransaction.objects.with_confirmations_required()
+            .first()
+            .confirmations_required,
+            number_confirmations,
+        )
+
+        # If there's SafeLastStatus present, it should be returned
+        # Not matching SafeLastStatus should return the number of confirmations
+        SafeLastStatusFactory(nonce=2, threshold=16)
+        self.assertEqual(
+            MultisigTransaction.objects.with_confirmations_required()
+            .first()
+            .confirmations_required,
+            number_confirmations,
+        )
+
+        SafeLastStatusFactory(address=safe_address, nonce=2, threshold=15)
+        self.assertEqual(
+            MultisigTransaction.objects.with_confirmations_required()
+            .first()
+            .confirmations_required,
+            15,
+        )
+
+        # Update SafeStatus to match the Multisig Tx nonce
+        safe_status.nonce = multisig_transaction.nonce
         safe_status.save(update_fields=["nonce"])
 
         self.assertEqual(
@@ -1513,7 +1689,7 @@ class TestMultisigTransactions(TestCase):
         )
 
         # It will not be picked, as nonce is still matching the previous SafeStatus
-        SafeStatusFactory(address=multisig_transaction.safe, nonce=1, threshold=15)
+        new_safe_status = SafeStatusFactory(address=safe_address, nonce=1, threshold=15)
         self.assertEqual(
             MultisigTransaction.objects.with_confirmations_required()
             .first()
@@ -1521,33 +1697,8 @@ class TestMultisigTransactions(TestCase):
             8,
         )
 
-        multisig_transaction.nonce = 1
+        multisig_transaction.nonce = new_safe_status.nonce
         multisig_transaction.save(update_fields=["nonce"])
-        self.assertEqual(
-            MultisigTransaction.objects.with_confirmations_required()
-            .first()
-            .confirmations_required,
-            15,
-        )
-
-        # As EthereumTx is empty, the latest Safe Status will be used if available
-        multisig_transaction.ethereum_tx = None
-        multisig_transaction.save(update_fields=["ethereum_tx"])
-        self.assertIsNone(
-            MultisigTransaction.objects.with_confirmations_required()
-            .first()
-            .confirmations_required
-        )
-
-        # Not matching address should not return anything
-        SafeLastStatusFactory(nonce=2, threshold=16)
-        self.assertIsNone(
-            MultisigTransaction.objects.with_confirmations_required()
-            .first()
-            .confirmations_required
-        )
-
-        SafeLastStatusFactory(address=multisig_transaction.safe, nonce=2, threshold=15)
         self.assertEqual(
             MultisigTransaction.objects.with_confirmations_required()
             .first()
@@ -1585,14 +1736,17 @@ class TestMultisigTransactions(TestCase):
         self.assertIsNone(
             MultisigTransaction.objects.last_valid_transaction(safe_address)
         )
-        SafeStatusFactory(address=safe_address, owners=[multisig_confirmation.owner])
+        SafeStatusFactory(
+            address=safe_address,
+            owners=[multisig_confirmation.owner, Account.create().address],
+        )
         self.assertEqual(
             MultisigTransaction.objects.last_valid_transaction(safe_address),
             multisig_transaction,
         )
 
         multisig_transaction_2 = MultisigTransactionFactory(safe=safe_address, nonce=2)
-        multisig_confirmation_2 = MultisigConfirmationFactory(
+        MultisigConfirmationFactory(
             multisig_transaction=multisig_transaction_2,
             signature_type=SafeSignatureType.EOA.value,
             owner=multisig_confirmation.owner,
@@ -1601,67 +1755,3 @@ class TestMultisigTransactions(TestCase):
             MultisigTransaction.objects.last_valid_transaction(safe_address),
             multisig_transaction_2,
         )
-
-
-class TestWebHook(TestCase):
-    def test_matching_for_address(self):
-        addresses = [Account.create().address for _ in range(3)]
-        webhook_0 = WebHookFactory(address=addresses[0])
-        webhook_1 = WebHookFactory(address=addresses[1])
-
-        self.assertCountEqual(
-            WebHook.objects.matching_for_address(addresses[0]), [webhook_0]
-        )
-        self.assertCountEqual(
-            WebHook.objects.matching_for_address(addresses[1]), [webhook_1]
-        )
-
-        webhook_2 = WebHookFactory(address=None)
-        self.assertCountEqual(
-            WebHook.objects.matching_for_address(addresses[0]), [webhook_0, webhook_2]
-        )
-        self.assertCountEqual(
-            WebHook.objects.matching_for_address(addresses[1]), [webhook_1, webhook_2]
-        )
-        self.assertCountEqual(
-            WebHook.objects.matching_for_address(addresses[2]), [webhook_2]
-        )
-
-    def test_optional_auth(self):
-        web_hook = WebHookFactory.create(authorization=None)
-
-        web_hook.full_clean()
-
-    def test_invalid_urls(self) -> None:
-        param_list = [
-            "foo://bar",
-            "foo",
-            "://",
-        ]
-        for invalid_url in param_list:
-            with self.subTest(msg=f"{invalid_url} is not a valid url"):
-                with self.assertRaises(ValidationError):
-                    web_hook = WebHookFactory.create(url=invalid_url)
-                    web_hook.full_clean()
-
-            with self.subTest(msg=f"{invalid_url} is not a valid url"):
-                with self.assertRaises(ValidationError):
-                    web_hook = WebHookFactory.create(url=invalid_url)
-                    web_hook.full_clean()
-
-    def test_valid_urls(self) -> None:
-        param_list = [
-            "http://tx-service",
-            "https://tx-service",
-            "https://tx-service:8000",
-            "https://safe-transaction.mainnet.gnosis.io",
-            "http://mainnet-safe-transaction-web.safe.svc.cluster.local",
-        ]
-        for valid_url in param_list:
-            with self.subTest(msg=f"Valid url {valid_url} should not throw"):
-                web_hook = WebHookFactory.create(url=valid_url)
-                web_hook.full_clean()
-
-            with self.subTest(msg=f"Valid url {valid_url} should not throw"):
-                web_hook = WebHookFactory.create(url=valid_url)
-                web_hook.full_clean()

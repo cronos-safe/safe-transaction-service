@@ -1,5 +1,12 @@
 from .base import *  # noqa
 from .base import env
+from .base import (
+    REDIS_URL,
+    REDIS_CONNECTION_TIMEOUT_SECONDS,
+    REDIS_TIMEOUT_SECONDS,
+    REDIS_POOL_MAX_CONNECTIONS,
+)
+
 
 # GENERAL
 # ------------------------------------------------------------------------------
@@ -13,7 +20,10 @@ SECRET_KEY = env(
 # https://docs.djangoproject.com/en/dev/ref/settings/#allowed-hosts
 ALLOWED_HOSTS = env.list("DJANGO_ALLOWED_HOSTS", default=["*"])
 
-REDIS_URL = env.str("REDIS_URL")
+# SECURITY
+# ------------------------------------------------------------------------------
+# https://docs.djangoproject.com/en/dev/ref/middleware/#x-content-type-options-nosniff
+CSRF_TRUSTED_ORIGINS = env.list("CSRF_TRUSTED_ORIGINS", default=[])
 
 # CACHES
 # ------------------------------------------------------------------------------
@@ -24,12 +34,22 @@ CACHES = {
         "LOCATION": REDIS_URL,
         "OPTIONS": {
             "CLIENT_CLASS": "django_redis.client.DefaultClient",
-            # Mimicing memcache behavior.
+            "SOCKET_CONNECT_TIMEOUT": REDIS_CONNECTION_TIMEOUT_SECONDS,
+            "SOCKET_TIMEOUT": REDIS_TIMEOUT_SECONDS,
+            "CONNECTION_POOL_KWARGS": {"max_connections": REDIS_POOL_MAX_CONNECTIONS},
+            # Mimicking memcache behavior.
             # http://niwinz.github.io/django-redis/latest/#_memcached_exceptions_behavior
             "IGNORE_EXCEPTIONS": True,
         },
-    }
+    },
+    "local_storage": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        "LOCATION": "local_mem",
+    },
 }
+
+# Log redis exceptions ignored
+DJANGO_REDIS_LOG_IGNORED_EXCEPTIONS = True
 
 # django-debug-toolbar
 # ------------------------------------------------------------------------------
@@ -50,3 +70,6 @@ DEBUG_TOOLBAR_CONFIG = {
 }
 # https://django-debug-toolbar.readthedocs.io/en/latest/installation.html#internal-ips
 INTERNAL_IPS = ["127.0.0.1", "10.0.2.2"]
+
+# Enable to get the host from header
+USE_X_FORWARDED_HOST = True

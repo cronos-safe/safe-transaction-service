@@ -1,8 +1,8 @@
-from typing import Iterator
+from collections.abc import Iterator
 
 from django.core.management.base import BaseCommand
 
-from gnosis.eth import EthereumClientProvider
+from safe_eth.eth import get_auto_ethereum_client
 
 from ...models import EthereumTx
 
@@ -12,14 +12,14 @@ class Command(BaseCommand):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.ethereum_client = EthereumClientProvider()
+        self.ethereum_client = get_auto_ethereum_client()
 
     def fix_ethereum_txs(self, ethereum_txs: Iterator[EthereumTx]):
         if ethereum_txs:
             txs = self.ethereum_client.get_transactions(
                 [ethereum_tx.tx_hash for ethereum_tx in ethereum_txs]
             )
-            for tx, ethereum_tx in zip(txs, ethereum_txs):
+            for tx, ethereum_tx in zip(txs, ethereum_txs, strict=False):
                 if tx and "maxFeePerGas" in tx:
                     self.stdout.write(
                         self.style.SUCCESS(
