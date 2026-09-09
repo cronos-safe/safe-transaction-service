@@ -1,7 +1,8 @@
 import datetime
+from collections import OrderedDict
+from collections.abc import Sequence
 from functools import cached_property
 from logging import getLogger
-from typing import Any
 
 from django.conf import settings
 
@@ -17,17 +18,20 @@ from safe_eth.eth.contracts import (
     get_safe_V1_1_1_contract,
     get_safe_V1_3_0_contract,
     get_safe_V1_4_1_contract,
+    get_safe_V1_5_0_contract,
 )
 from safe_eth.util.util import to_0x_hex_str
 from web3.contract.contract import ContractEvent
-from web3.types import EventData
+from web3.types import EventData, LogReceipt, TxData, TxReceipt
 
 from ..models import (
     EthereumBlock,
+    EthereumTx,
     EthereumTxCallType,
     InternalTx,
     InternalTxDecoded,
     InternalTxType,
+    SafeContract,
     SafeMasterCopy,
     SafeRelevantTransaction,
 )
@@ -54,7 +58,7 @@ class SafeEventsIndexerProvider:
 
 class SafeEventsIndexer(EventsIndexer):
     """
-    Indexes Gnosis Safe L2 events
+    Indexes Safe L2 events
     """
 
     IGNORE_ADDRESSES_ON_LOG_FILTER = (
@@ -65,10 +69,243 @@ class SafeEventsIndexer(EventsIndexer):
         kwargs.setdefault(
             "eth_zksync_compatible_network", settings.ETH_ZKSYNC_COMPATIBLE_NETWORK
         )
+        kwargs.setdefault("ignored_initiators", settings.ETH_EVENTS_IGNORED_INITIATORS)
+        kwargs.setdefault("ignored_to", settings.ETH_EVENTS_IGNORED_TO)
+
         self.eth_zksync_compatible_network = kwargs["eth_zksync_compatible_network"]
+        self.ignored_initiators = kwargs["ignored_initiators"]
+        self.ignored_to = kwargs["ignored_to"]
+        self.conditional_indexing_enabled = bool(
+            self.ignored_initiators or self.ignored_to
+        )
         # Cache timestamp for block hashes
         self.block_hashes_with_timestamp: dict[bytes, datetime.datetime] = {}
         super().__init__(*args, **kwargs)
+
+    def process_elements(self, log_receipts: Sequence[LogReceipt]) -> list[InternalTx]:
+        """
+        Override to filter events by tx._from and tx.to when conditional indexing is enabled.
+        This avoids storing EthereumTx in database for blocklisted addresses.
+        """
+        if not log_receipts:
+            return []
+
+        if not self.conditional_indexing_enabled:
+            # No blocklist configured, use standard flow
+            return super().process_elements(log_receipts)
+
+        return self._process_elements_with_conditional_indexing(log_receipts)
+
+    def _process_elements_with_conditional_indexing(
+        self, log_receipts: Sequence[LogReceipt]
+    ) -> list[InternalTx]:
+        # --- Conditional indexing enabled ---
+        logger.debug("Conditional indexing: filtering events by tx._from and tx.to")
+
+        # 1. Filter already processed log receipts and normalize tx hashes once
+        not_processed_log_receipts: list[LogReceipt] = []
+        not_processed_tx_hashes_by_index: list[bytes] = []
+        for log_receipt in log_receipts:
+            if self._is_processed(
+                log_receipt["transactionHash"],
+                log_receipt["blockHash"],
+                log_receipt["logIndex"],
+            ):
+                continue
+            not_processed_log_receipts.append(log_receipt)
+            not_processed_tx_hashes_by_index.append(
+                HexBytes(log_receipt["transactionHash"])
+            )
+
+        if not not_processed_log_receipts:
+            return []
+
+        # 2. Get unique tx_hashes preserving order
+        tx_hashes = list(OrderedDict.fromkeys(not_processed_tx_hashes_by_index).keys())
+
+        # 3. Check DB for existing txs
+        db_txs: dict[bytes, EthereumTx] = {
+            HexBytes(tx.tx_hash): tx
+            for tx in EthereumTx.objects.filter(tx_hash__in=tx_hashes).exclude(
+                block=None
+            )
+        }
+        logger.debug("Conditional indexing: found %d existing txs in DB", len(db_txs))
+
+        # 4. Fetch missing txs from RPC (without receipts - we'll fetch those only for allowed txs)
+        missing_hashes = [tx_hash for tx_hash in tx_hashes if tx_hash not in db_txs]
+        logger.debug(
+            "Conditional indexing: fetching %d missing txs from RPC",
+            len(missing_hashes),
+        )
+        fetched_txs = self._fetch_txs(missing_hashes)
+
+        # 5. Filter by _from and to (blocklist check)
+        allowed_tx_hashes: set[bytes] = set()
+
+        # Check existing DB txs
+        for tx_hash, db_tx in db_txs.items():
+            if db_tx._from in self.ignored_initiators:
+                logger.debug(
+                    "Conditional indexing: filtering existing tx %s from blocklisted initiator %s",
+                    to_0x_hex_str(tx_hash),
+                    db_tx._from,
+                )
+            elif db_tx.to in self.ignored_to:
+                logger.debug(
+                    "Conditional indexing: filtering existing tx %s to blocklisted address %s",
+                    to_0x_hex_str(tx_hash),
+                    db_tx.to,
+                )
+            else:
+                allowed_tx_hashes.add(tx_hash)
+
+        # Check fetched txs, filter allowed ones
+        allowed_fetched_txs: list[TxData] = []
+        for tx in fetched_txs:
+            tx_hash = HexBytes(tx["hash"])
+            tx_from = tx.get("from")
+            tx_to = tx.get("to")
+            if tx_from in self.ignored_initiators:
+                logger.debug(
+                    "Conditional indexing: filtering tx %s from blocklisted initiator %s",
+                    to_0x_hex_str(tx_hash),
+                    tx_from,
+                )
+            elif tx_to in self.ignored_to:
+                logger.debug(
+                    "Conditional indexing: filtering tx %s to blocklisted address %s",
+                    to_0x_hex_str(tx_hash),
+                    tx_to,
+                )
+            else:
+                allowed_fetched_txs.append(tx)
+                allowed_tx_hashes.add(tx_hash)
+
+        logger.debug(
+            "Conditional indexing: %d/%d txs allowed after filtering",
+            len(allowed_tx_hashes),
+            len(tx_hashes),
+        )
+
+        # 6. Filter log_receipts to only allowed txs
+        filtered_log_receipts = [
+            log_receipt
+            for log_receipt, tx_hash in zip(
+                not_processed_log_receipts,
+                not_processed_tx_hashes_by_index,
+                strict=False,
+            )
+            if tx_hash in allowed_tx_hashes
+        ]
+
+        # 7. Decode elements BEFORE creating EthereumTx
+        decoded_elements = self.decode_elements(filtered_log_receipts)
+
+        # 8. Filter to only events that will be processed
+        processable_events = self._get_processable_events(decoded_elements)
+
+        # 9. Get tx_hashes only from processable events
+        tx_hashes_to_create = list(
+            OrderedDict.fromkeys(
+                HexBytes(event["transactionHash"]) for event in processable_events
+            ).keys()
+        )
+
+        logger.debug(
+            "Conditional indexing: %d/%d txs have processable events",
+            len(tx_hashes_to_create),
+            len(allowed_tx_hashes),
+        )
+
+        # 10. Filter allowed_fetched_txs to only those with processable events
+        allowed_fetched_txs_filtered = [
+            tx
+            for tx in allowed_fetched_txs
+            if HexBytes(tx["hash"]) in tx_hashes_to_create
+        ]
+
+        # 11. Fetch receipts and store ONLY for txs with processable events
+        if allowed_fetched_txs_filtered:
+            number_allowed_txs_inserted = self._fetch_receipts_and_store(
+                allowed_fetched_txs_filtered
+            )
+            logger.debug(
+                "Conditional indexing: %d txs with processable events inserted",
+                number_allowed_txs_inserted,
+            )
+
+        # 12. Process only the processable events
+        # (filtering already done by _get_processable_events)
+        processed_elements = self._process_decoded_elements(processable_events)
+
+        # 13. Mark ALL original receipts as processed (so we don't re-fetch blocked ones)
+        for log_receipt in not_processed_log_receipts:
+            self._mark_processed(
+                log_receipt["transactionHash"],
+                log_receipt["blockHash"],
+                log_receipt["logIndex"],
+            )
+
+        return processed_elements
+
+    def _get_processable_events(
+        self, decoded_elements: list[EventData]
+    ) -> list[EventData]:
+        """
+        Filter decoded elements to only those that will be processed.
+        When conditional indexing is enabled, non-creation events are only
+        processed if their Safe exists in SafeContract table or is created
+        in the same batch.
+
+        :param decoded_elements: All decoded events
+        :return: Filtered list of events that will actually be processed
+        """
+        if not self.conditional_indexing_enabled:
+            return decoded_elements
+
+        # Single iteration: separate creation/non-creation events and collect addresses
+        creation_events = []
+        non_creation_events = []
+        non_creation_addresses = set()
+        creation_addresses = set()
+
+        for element in decoded_elements:
+            if element["event"] in ("SafeSetup", "ProxyCreation"):
+                creation_events.append(element)
+                if element["event"] == "SafeSetup":
+                    creation_addresses.add(element["address"])
+                else:
+                    proxy_address = element["args"].get("proxy")
+                    if proxy_address:
+                        creation_addresses.add(proxy_address)
+            else:
+                non_creation_events.append(element)
+                non_creation_addresses.add(element["address"])
+
+        # Filter non-creation events by SafeContract existence
+        if non_creation_addresses:
+            existing_addresses = SafeContract.objects.get_existing_addresses(
+                non_creation_addresses
+            )
+            allowed_addresses = set(existing_addresses) | creation_addresses
+            logger.debug(
+                "Conditional indexing: %d/%d Safes found in database for event filtering "
+                "(%d created in batch)",
+                len(existing_addresses),
+                len(non_creation_addresses),
+                len(creation_addresses),
+            )
+            filtered_non_creation = [
+                element
+                for element in non_creation_events
+                if element["address"] in allowed_addresses
+            ]
+        else:
+            filtered_non_creation = []
+
+        # Return: all creation events + filtered non-creation events
+        return creation_events + filtered_non_creation
 
     @cached_property
     def contract_events(self) -> list[ContractEvent]:
@@ -220,6 +457,11 @@ class SafeEventsIndexer(EventsIndexer):
         # ProxyFactory
         event ProxyCreation(GnosisSafeProxy indexed proxy, address singleton);
 
+        Safe v1.5.0 L2 Events
+        ProxyCreationL2 or ChainSpecificProxyCreationL2 are not considered here because tracking ProxyCreation is enough.
+        ------------------
+        event ChangedModuleGuard(address indexed moduleGuard);
+
         :return: List of supported `ContractEvent`
         """
         proxy_factory_v1_4_1_contract = get_proxy_factory_V1_4_1_contract(
@@ -228,6 +470,7 @@ class SafeEventsIndexer(EventsIndexer):
         proxy_factory_v1_3_0_contract = get_proxy_factory_V1_3_0_contract(
             self.ethereum_client.w3
         )
+        safe_l2_v1_5_0_contract = get_safe_V1_5_0_contract(self.ethereum_client.w3)
         safe_l2_v1_4_1_contract = get_safe_V1_4_1_contract(self.ethereum_client.w3)
         safe_l2_v1_3_0_contract = get_safe_V1_3_0_contract(self.ethereum_client.w3)
         safe_v1_1_1_contract = get_safe_V1_1_1_contract(self.ethereum_client.w3)
@@ -269,6 +512,8 @@ class SafeEventsIndexer(EventsIndexer):
                 # Changed Guard
                 safe_l2_v1_4_1_contract.events.ChangedGuard(),
                 safe_l2_v1_3_0_contract.events.ChangedGuard(),
+                # Change Module Guard
+                safe_l2_v1_5_0_contract.events.ChangedModuleGuard(),
                 # Change Master Copy
                 safe_v1_1_1_contract.events.ChangedMasterCopy(),
                 # Proxy creation
@@ -434,6 +679,8 @@ class SafeEventsIndexer(EventsIndexer):
             internal_tx_decoded.function_name = "setFallbackHandler"
         elif event_name == "ChangedGuard":
             internal_tx_decoded.function_name = "setGuard"
+        elif event_name == "ChangedModuleGuard":
+            internal_tx_decoded.function_name = "setModuleGuard"
         elif (
             event_name == "SafeReceived" and not self.eth_zksync_compatible_network
         ):  # Received ether
@@ -482,8 +729,8 @@ class SafeEventsIndexer(EventsIndexer):
         self, decoded_elements: list[EventData]
     ) -> dict[ChecksumAddress, list[EventData]]:
         """
-        Get the creation events (ProxyCreation and SafeSetup) from decoded elements and generates a dictionary
-        that groups these events by Safe address, so they are processed together
+        Get the creation events (SafeSetup and ProxyCreation) from decoded elements and generates a dictionary
+        that groups these events by Safe address, so they are processed together.
 
         :param decoded_elements:
         :return: dictionary with creation events by Safe address
@@ -509,13 +756,16 @@ class SafeEventsIndexer(EventsIndexer):
         safe_addresses_with_creation_events: dict[ChecksumAddress, list[EventData]],
     ) -> list[InternalTx]:
         """
-        Process creation events (ProxyCreation and SafeSetup). They must be processed together
+        Process creation events (ProxyCreation and SafeSetup). They must be processed together.
+        Usual order is:
+        - SafeSetup
+        - ProxyCreation
 
         :param safe_addresses_with_creation_events:
-        :return:
+        :return: Generated InternalTxs for safe creation
         """
-        internal_txs = []
-        internal_txs_decoded = []
+        internal_txs: list[InternalTx] = []
+        internal_txs_decoded: list[InternalTxDecoded] = []
 
         logger.debug("Processing Safe Creation events")
 
@@ -525,10 +775,11 @@ class SafeEventsIndexer(EventsIndexer):
             "Got %d addresses to index, checking if some are indexed",
             len(safe_creation_events_addresses),
         )
+        # Check if SafeSetup event was indexed. ProxyCreation must not come after SafeSetup, so we consider
+        # indexed a Safe with a SafeSetup event processed (InternalTxDecoded with `function_name="setup"`).
         indexed_addresses = InternalTxDecoded.objects.filter(
             safe_address__in=safe_creation_events_addresses,
             function_name="setup",
-            internal_tx__contract_address=None,
         ).values_list("safe_address", flat=True)
         # Ignoring the already indexed contracts
         addresses_to_index = safe_creation_events_addresses - set(indexed_addresses)
@@ -539,95 +790,110 @@ class SafeEventsIndexer(EventsIndexer):
         logger.debug(
             "InternalTx and InternalTxDecoded objects for creation will be built"
         )
+        # Track Safe addresses and their creation tx hashes for SafeContract creation
+        created_safe_address_with_tx_hash: dict[ChecksumAddress, bytes] = {}
+
         for safe_address in addresses_to_index:
             events = safe_addresses_with_creation_events[safe_address]
-            for event_position, event in enumerate(events):
+
+            # Find events by type (each Safe should have at most one of each)
+            setup_event: EventData | None = None
+            proxy_creation_event: EventData | None = None
+            for event in events:
                 if event["event"] == "SafeSetup":
                     setup_event = event
-                    # If we have both events we should extract Singleton and trace_address from ProxyCreation event
-                    if len(events) > 1:
-                        if (
-                            event_position == 0
-                            and events[1]["event"] == "ProxyCreation"
-                        ):
-                            # Usually SafeSetup is the first event and next is ProxyCreation when ProxyFactory is called with initializer.
-                            proxy_creation_event = events[1]
-                        elif (
-                            event_position == 1
-                            and events[0]["event"] == "ProxyCreation"
-                        ):
-                            # ProxyCreation first and SafeSetup later
-                            proxy_creation_event = events[0]
-                        else:
-                            # This shouldn't happen, as there will be no proxy_creation event
-                            continue
-                    else:
-                        logger.debug(
-                            "[%s] Proxy was created in previous blocks, deleting the old InternalTx",
-                            safe_address,
-                        )
-                        # Proxy was created in previous blocks.
-                        proxy_creation_event = None
-                        # Safe was created and configure it in the next transaction. Remove it if that's the case
-                        InternalTx.objects.filter(
-                            contract_address=safe_address
-                        ).delete()
-                        logger.debug(
-                            "[%s] Proxy was created in previous blocks, old InternalTx deleted",
-                            safe_address,
-                        )
-
-                    # Generate InternalTx and internalDecodedTx for SafeSetup event
-                    setup_trace_address = (
-                        f"{proxy_creation_event['logIndex']},0"
-                        if proxy_creation_event
-                        else str(setup_event["logIndex"])
-                    )
-                    singleton = (
-                        proxy_creation_event["args"].get("singleton")
-                        if proxy_creation_event
-                        else NULL_ADDRESS
-                    )
-                    # Keep previous implementation
-                    contract_address = None if proxy_creation_event else safe_address
-                    internal_tx = self._get_internal_tx_from_decoded_element(
-                        setup_event,
-                        contract_address=contract_address,
-                        to=singleton,
-                        trace_address=setup_trace_address,
-                        call_type=EthereumTxCallType.DELEGATE_CALL.value,
-                    )
-                    # Generate InternalDecodedTx for SafeSetup event
-                    setup_args = dict(event["args"])
-                    setup_args["payment"] = 0
-                    setup_args["paymentReceiver"] = NULL_ADDRESS
-                    setup_args["_threshold"] = setup_args.pop("threshold")
-                    setup_args["_owners"] = setup_args.pop("owners")
-                    internal_tx_decoded = InternalTxDecoded(
-                        internal_tx=internal_tx,
-                        function_name="setup",
-                        arguments=setup_args,
-                        safe_address=internal_tx._from,  # Denormalized for efficient querying
-                    )
-                    internal_txs.append(internal_tx)
-                    internal_txs_decoded.append(internal_tx_decoded)
                 elif event["event"] == "ProxyCreation":
                     proxy_creation_event = event
-                    # Generate InternalTx for ProxyCreation
-                    internal_tx = self._get_internal_tx_from_decoded_element(
-                        proxy_creation_event,
-                        contract_address=proxy_creation_event["args"].get("proxy"),
-                        tx_type=InternalTxType.CREATE.value,
-                        call_type=None,
-                    )
-                    internal_txs.append(internal_tx)
                 else:
-                    logger.error(f"Event is not a Safe creation event {event['event']}")
+                    logger.error("Unexpected event type: %s", event["event"])
+
+            # Process ProxyCreation - creates the proxy contract
+            if proxy_creation_event:
+                internal_tx = self._get_internal_tx_from_decoded_element(
+                    proxy_creation_event,
+                    contract_address=proxy_creation_event["args"].get("proxy"),
+                    tx_type=InternalTxType.CREATE.value,
+                    call_type=None,
+                )
+                internal_txs.append(internal_tx)
+
+            # Process SafeSetup - initializes the Safe
+            if setup_event:
+                if not proxy_creation_event:
+                    # SafeSetup without ProxyCreation means proxy was created in a previous block
+                    # ProxyCreation is also emitted when ProxyCreationL2 or ChainSpecificProxyCreationL2 are emmited on v1.5.0.
+                    logger.debug(
+                        "[%s] Proxy was created in previous blocks, deleting the old InternalTx",
+                        safe_address,
+                    )
+                    InternalTx.objects.filter(contract_address=safe_address).delete()
+                    logger.debug(
+                        "[%s] Proxy was created in previous blocks, old InternalTx deleted",
+                        safe_address,
+                    )
+
+                # Determine trace_address and singleton based on whether ProxyCreation exists
+                if proxy_creation_event:
+                    setup_trace_address = f"{proxy_creation_event['logIndex']},0"
+                    singleton = proxy_creation_event["args"].get("singleton")
+                    # contract_address=None signals this came via event indexer with ProxyCreation
+                    contract_address = None
+                else:
+                    setup_trace_address = str(setup_event["logIndex"])
+                    singleton = NULL_ADDRESS
+                    contract_address = safe_address
+
+                internal_tx = self._get_internal_tx_from_decoded_element(
+                    setup_event,
+                    contract_address=contract_address,
+                    to=singleton,
+                    trace_address=setup_trace_address,
+                    call_type=EthereumTxCallType.DELEGATE_CALL.value,
+                )
+
+                # Generate InternalDecodedTx for SafeSetup event
+                setup_args = dict(setup_event["args"])
+                setup_args["payment"] = 0
+                setup_args["paymentReceiver"] = NULL_ADDRESS
+                setup_args["_threshold"] = setup_args.pop("threshold")
+                setup_args["_owners"] = setup_args.pop("owners")
+                internal_tx_decoded = InternalTxDecoded(
+                    internal_tx=internal_tx,
+                    function_name="setup",
+                    arguments=setup_args,
+                    safe_address=internal_tx._from,  # Denormalized for efficient querying
+                )
+                internal_txs.append(internal_tx)
+                internal_txs_decoded.append(internal_tx_decoded)
+
+                # Track for SafeContract creation
+                created_safe_address_with_tx_hash[safe_address] = setup_event[
+                    "transactionHash"
+                ]
 
         logger.debug("InternalTx and InternalTxDecoded objects for creation were built")
-        return InternalTx.objects.store_internal_txs_and_decoded_in_db(
+
+        stored_internal_txs = InternalTx.objects.store_internal_txs_and_decoded_in_db(
             internal_txs, internal_txs_decoded
         )
+
+        # Create SafeContract entries for newly created Safes
+        # This ensures SafeContract exists before non-creation events are filtered
+        # (when conditional indexing is enabled)
+        if created_safe_address_with_tx_hash:
+            logger.debug(
+                "Creating %d SafeContract entries for new Safes",
+                len(created_safe_address_with_tx_hash),
+            )
+            SafeContract.objects.bulk_create(
+                [
+                    SafeContract(address=safe_address, ethereum_tx_id=tx_hash)
+                    for safe_address, tx_hash in created_safe_address_with_tx_hash.items()
+                ],
+                ignore_conflicts=True,  # Safe may already exist from previous indexing
+            )
+
+        return stored_internal_txs
 
     def _prefetch_timestamp_for_blocks(
         self, decoded_elements: list[EventData]
@@ -653,8 +919,92 @@ class SafeEventsIndexer(EventsIndexer):
         logger.debug("Ended prefetching timestamp for every block hash")
         return block_hashes_with_timestamp
 
-    def _process_decoded_elements(self, decoded_elements: list[EventData]) -> list[Any]:
-        processed_elements = []
+    def _fetch_txs(self, tx_hashes: list[bytes]) -> list[TxData]:
+        """
+        Fetch transactions from RPC without receipts.
+        Used for conditional indexing to check tx._from before deciding to fetch receipts.
+
+        :param tx_hashes: List of transaction hashes to fetch
+        :return: List of transactions
+        """
+        if not tx_hashes:
+            return []
+
+        txs: list[TxData] = []
+        for tx_hash, tx in zip(
+            tx_hashes,
+            self.ethereum_client.get_transactions(tx_hashes),
+            strict=False,
+        ):
+            tx = tx or self.ethereum_client.get_transaction(tx_hash)  # Retry if failed
+            if tx:
+                txs.append(tx)
+
+        return txs
+
+    def _fetch_receipts_and_store(self, txs: list[TxData]) -> int:
+        """
+        Fetch receipts for allowed transactions and store them in the database.
+        Called after filtering by tx._from to avoid fetching receipts for blocklisted txs.
+
+        :param txs: List of allowed transactions to fetch receipts for and store
+        :return: Number of transactions inserted
+        """
+        if not txs:
+            return 0
+
+        tx_hashes = [tx["hash"] for tx in txs]
+
+        # Fetch receipts for allowed transactions
+        logger.debug(
+            "Conditional indexing: fetching %d receipts for allowed txs",
+            len(tx_hashes),
+        )
+
+        # Build list of (tx, receipt) pairs, only including successful receipt fetches
+        txs_with_receipts: list[tuple[TxData, TxReceipt]] = []
+        for tx, tx_receipt in zip(
+            txs,
+            self.ethereum_client.get_transaction_receipts(tx_hashes),
+            strict=False,
+        ):
+            tx_receipt = tx_receipt or self.ethereum_client.get_transaction_receipt(
+                tx["hash"]
+            )  # Retry if failed
+            if tx_receipt:
+                txs_with_receipts.append((tx, tx_receipt))
+            else:
+                logger.warning(
+                    "Conditional indexing: failed to fetch receipt for tx %s",
+                    to_0x_hex_str(tx["hash"]),
+                )
+
+        if not txs_with_receipts:
+            return 0
+
+        # Collect block hashes only from txs with successful receipts
+        block_hashes = {to_0x_hex_str(tx["blockHash"]) for tx, _ in txs_with_receipts}
+
+        # Create blocks
+        logger.debug("Conditional indexing: inserting %d blocks", len(block_hashes))
+        self.index_service.txs_create_or_update_from_block_hashes(block_hashes)
+
+        # Create EthereumTx records
+        logger.debug(
+            "Conditional indexing: inserting %d transactions", len(txs_with_receipts)
+        )
+        ethereum_txs_to_insert = [
+            EthereumTx.objects.from_tx_dict(tx, receipt)
+            for tx, receipt in txs_with_receipts
+        ]
+        return EthereumTx.objects.bulk_create_from_generator(
+            iter(ethereum_txs_to_insert), ignore_conflicts=True
+        )
+
+    def _process_decoded_elements(
+        self, decoded_elements: list[EventData]
+    ) -> list[InternalTx]:
+        processed_elements: list[InternalTx] = []
 
         self.block_hashes_with_timestamp = self._prefetch_timestamp_for_blocks(
             decoded_elements
@@ -666,10 +1016,22 @@ class SafeEventsIndexer(EventsIndexer):
         )
         if safe_addresses_creation_events:
             # Process safe creation events
+            # Note: When conditional indexing is enabled, events are already filtered
+            # by tx._from in process_elements() before reaching this point
             creation_events_processed = self._process_safe_creation_events(
                 safe_addresses_creation_events
             )
             processed_elements.extend(creation_events_processed)
+
+        # Filter out creation events (SafeSetup, ProxyCreation)
+        # Note: When conditional indexing is enabled, decoded_elements are already
+        # filtered by _get_processable_events() in process_elements() to only include
+        # events that will be processed (SafeContract existence check already done)
+        elements_to_process = [
+            element
+            for element in decoded_elements
+            if element["event"] not in ("SafeSetup", "ProxyCreation")
+        ]
 
         # Store everything together in the database if possible
         logger.debug("InternalTx and InternalTx for non creation events will be built")
@@ -677,7 +1039,7 @@ class SafeEventsIndexer(EventsIndexer):
         internal_txs_decoded_to_insert: list[InternalTxDecoded] = []
         safe_relevant_txs: list[SafeRelevantTransaction] = []
         # Process the rest of Safe events. Store all together
-        for decoded_element in decoded_elements:
+        for decoded_element in elements_to_process:
             elements_to_insert = self._process_decoded_element(decoded_element)
             for element_to_insert in elements_to_insert:
                 if isinstance(element_to_insert, InternalTx):
@@ -688,14 +1050,16 @@ class SafeEventsIndexer(EventsIndexer):
                     safe_relevant_txs.append(element_to_insert)
         logger.debug("InternalTx and InternalTx for non creation events were built")
 
-        stored_internal_txs = InternalTx.objects.store_internal_txs_and_decoded_in_db(
-            internal_txs_to_insert, internal_txs_decoded_to_insert
+        stored_internal_txs: list[InternalTx] = (
+            InternalTx.objects.store_internal_txs_and_decoded_in_db(
+                internal_txs_to_insert, internal_txs_decoded_to_insert
+            )
         )
         logger.debug("Inserting %d SafeRelevantTransaction", len(safe_relevant_txs))
         SafeRelevantTransaction.objects.bulk_create(
             safe_relevant_txs, ignore_conflicts=True
         )
-        logger.debug("Inserted SafeRelevantTransaction")
+        logger.debug("Inserted %d SafeRelevantTransaction", len(safe_relevant_txs))
 
         processed_elements.extend(stored_internal_txs)
         return processed_elements
