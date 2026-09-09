@@ -1,4 +1,5 @@
 import datetime
+import json
 from collections.abc import Iterator, Sequence
 from decimal import Decimal
 from enum import Enum
@@ -407,10 +408,12 @@ class EthereumTxManager(BulkCreateSignalMixin, models.Manager):
         """
         :return: Transactions containing ERC4337 `UserOperation` event
         """
-        query = '{"topics": ["' + to_0x_hex_str(USER_OPERATION_EVENT_TOPIC) + '"]}'
+        # Use json.dumps to safely construct the JSON query string
+        query_json = json.dumps({"topics": [to_0x_hex_str(USER_OPERATION_EVENT_TOPIC)]})
 
         return self.raw(
-            f"SELECT * FROM history_ethereumtx WHERE '{query}'::jsonb <@ ANY (logs)"
+            "SELECT * FROM history_ethereumtx WHERE %s::jsonb <@ ANY (logs)",
+            [query_json],
         )
 
 
@@ -428,18 +431,18 @@ class EthereumTx(TimeStampedModel):
     tx_hash = Keccak256Field(primary_key=True)
     gas_used = Uint256Field(null=True, default=None)  # If mined
     status = models.IntegerField(
-        null=True, default=None, db_index=True
+        null=True, default=None
     )  # If mined. Old txs don't have `status`
     logs = ArrayField(JSONField(), null=True, default=None)  # If mined
     transaction_index = models.PositiveIntegerField(null=True, default=None)  # If mined
-    _from = EthereumAddressBinaryField(null=True, db_index=True)
+    _from = EthereumAddressBinaryField(null=True)
     gas = Uint256Field()
     gas_price = Uint256Field()
     max_fee_per_gas = Uint256Field(null=True, blank=True, default=None)
     max_priority_fee_per_gas = Uint256Field(null=True, blank=True, default=None)
     data = models.BinaryField(null=True)
     nonce = Uint256Field()
-    to = EthereumAddressBinaryField(null=True, db_index=True)
+    to = EthereumAddressBinaryField(null=True)
     value = Uint256Field()
     type = models.PositiveSmallIntegerField(default=0)
 
@@ -514,6 +517,9 @@ class TokenTransferQuerySet(models.QuerySet):
 
     def outgoing(self, address: ChecksumAddress):
         return self.filter(_from=address)
+
+    def not_self_transfers(self):
+        return self.exclude(_from=F("to"))
 
     def token_txs(self):
         raise NotImplementedError
@@ -1086,6 +1092,34 @@ class InternalTxQuerySet(models.QuerySet):
             .order_by("-block")
         )
 
+    def union_optimized_ether_and_token_txs(
+        self,
+        erc20_in_queryset: QuerySet,
+        erc20_out_queryset: QuerySet,
+        erc721_in_queryset: QuerySet,
+        erc721_out_queryset: QuerySet,
+        ether_queryset: QuerySet,
+    ) -> TransferDict:
+        values = [
+            "block",
+            "transaction_hash",
+            "to",
+            "_from",
+            "_value",
+            "execution_date",
+            "_token_id",
+            "token_address",
+            "_log_index",
+            "_trace_address",
+        ]
+        return (
+            ether_queryset.values(*values)
+            .union(erc20_in_queryset.values(*values), all=True)
+            .union(erc20_out_queryset.values(*values), all=True)
+            .union(erc721_in_queryset.values(*values), all=True)
+            .union(erc721_out_queryset.values(*values), all=True)
+        )
+
     def ether_txs_values(
         self,
         ether_queryset: QuerySet,
@@ -1325,7 +1359,14 @@ class InternalTxDecodedQuerySet(models.QuerySet):
         return (
             self.not_processed()
             .order_by_processing_queue()
-            .select_related("internal_tx", "internal_tx__ethereum_tx")
+            .select_related("internal_tx__ethereum_tx")
+            # Defer large blob fields not used during processing to reduce memory usage
+            .defer(
+                "internal_tx__data",
+                "internal_tx__code",
+                "internal_tx__output",
+                "internal_tx__ethereum_tx__data",
+            )
         )
 
     def pending_for_safe(self, safe_address: ChecksumAddress):
@@ -1353,7 +1394,7 @@ class InternalTxDecoded(models.Model):
         related_name="decoded_tx",
         primary_key=True,
     )
-    function_name = models.CharField(max_length=256, db_index=True)
+    function_name = models.CharField(max_length=256)
     arguments = JSONField()
     processed = models.BooleanField(default=False)
     # Denormalized from internal_tx._from for efficient querying
@@ -1363,12 +1404,12 @@ class InternalTxDecoded(models.Model):
     class Meta:
         indexes = [
             models.Index(
-                name="history_decoded_processed_idx",
+                name="history_decoded_not_proc_idx",
                 fields=["internal_tx_id"],
                 condition=Q(processed=False),
             ),
             models.Index(
-                name="history_decoded_not_proc_idx",
+                name="history_decoded_processed_idx",
                 fields=["internal_tx_id"],
                 condition=Q(processed=True),  # For finding out of order transactions
             ),
@@ -1378,6 +1419,13 @@ class InternalTxDecoded(models.Model):
                 name="history_decoded_pending_idx",
                 fields=["safe_address"],
                 condition=Q(processed=False),
+            ),
+            # For checking if a Safe has already been indexed (has setup InternalTxDecoded)
+            # Small index since function_name='setup' is rare (one per Safe creation)
+            models.Index(
+                name="history_decoded_setup_idx",
+                fields=["safe_address"],
+                condition=Q(function_name="setup"),
             ),
         ]
         verbose_name_plural = "Internal txs decoded"
@@ -1981,6 +2029,18 @@ class SafeContractManager(models.Manager):
             Min("ethereum_tx__block_id")
         )["ethereum_tx__block_id__min"]
 
+    def get_existing_addresses(
+        self, addresses: Sequence[ChecksumAddress]
+    ) -> set[ChecksumAddress]:
+        """
+        Get addresses that exist in SafeContract table.
+        Used for conditional indexing to filter events for known Safes.
+
+        :param addresses: List of addresses to check
+        :return: Set of addresses that exist in SafeContract table
+        """
+        return set(self.filter(address__in=addresses).values_list("address", flat=True))
+
 
 class SafeContractQuerySet(models.QuerySet):
     def banned(
@@ -2194,6 +2254,7 @@ class SafeStatusBase(models.Model):
     master_copy = EthereumAddressBinaryField()
     fallback_handler = EthereumAddressBinaryField()
     guard = EthereumAddressBinaryField(default=None, null=True)
+    module_guard = EthereumAddressBinaryField(default=None, null=True)
     enabled_modules = ArrayField(EthereumAddressBinaryField(), default=list, blank=True)
 
     class Meta:
@@ -2241,6 +2302,7 @@ class SafeStatusBase(models.Model):
             master_copy=safe_status_base.master_copy,
             fallback_handler=safe_status_base.fallback_handler,
             guard=safe_status_base.guard,
+            module_guard=safe_status_base.module_guard,
             enabled_modules=safe_status_base.enabled_modules,
         )
 
@@ -2274,6 +2336,7 @@ class SafeLastStatusManager(models.Manager):
                 "master_copy": safe_status.master_copy,
                 "fallback_handler": safe_status.fallback_handler,
                 "guard": safe_status.guard,
+                "module_guard": safe_status.module_guard,
                 "enabled_modules": safe_status.enabled_modules,
             },
         )
@@ -2298,6 +2361,20 @@ class SafeLastStatusManager(models.Manager):
         return self.filter(owners__contains=[owner_address]).values_list(
             "address", flat=True
         )
+
+    def safes_for_owner(self, owner_address: str) -> QuerySet["SafeLastStatus"]:
+        """
+        :param owner_address:
+        :return: SafeLastStatus queryset where the provided `owner_address` is an owner
+        """
+        return self.filter(owners__contains=[owner_address])
+
+    def safes_for_module(self, module_address: str) -> QuerySet["SafeLastStatus"]:
+        """
+        :param module_address:
+        :return: SafeLastStatus queryset where the provided `module_address` is enabled
+        """
+        return self.filter(enabled_modules__contains=[module_address])
 
 
 class SafeLastStatus(SafeStatusBase):
@@ -2333,6 +2410,7 @@ class SafeLastStatus(SafeStatusBase):
             self.owners,
             self.threshold,
             master_copy_version,
+            self.module_guard or NULL_ADDRESS,
         )
 
 

@@ -28,6 +28,7 @@ from safe_eth.eth.contracts import (
     get_safe_V1_1_1_contract,
     get_safe_V1_3_0_contract,
     get_safe_V1_4_1_contract,
+    get_safe_V1_5_0_contract,
     get_uniswap_exchange_contract,
 )
 from safe_eth.safe.multi_send import MultiSend
@@ -215,7 +216,7 @@ class SafeTxDecoder:
             decoded = decode_abi(types, cast(HexBytes, params))
             normalized = map_abi_data(BASE_RETURN_NORMALIZERS, types, decoded)
             values = map(self._parse_decoded_arguments, normalized)
-        except (ValueError, DecodingError) as exc:
+        except (ValueError, DecodingError, ArithmeticError) as exc:
             logger.warning("Cannot decode %s", to_0x_hex_str(data))
             raise UnexpectedProblemDecoding(data) from exc
 
@@ -339,6 +340,7 @@ class SafeTxDecoder:
             get_safe_V1_1_1_contract(self.dummy_w3).abi,
             get_safe_V1_3_0_contract(self.dummy_w3).abi,
             get_safe_V1_4_1_contract(self.dummy_w3).abi,
+            get_safe_V1_5_0_contract(self.dummy_w3).abi,
         ]
 
         # Order is important. If signature is the same (e.g. renaming of `baseGas`) last elements in the list
